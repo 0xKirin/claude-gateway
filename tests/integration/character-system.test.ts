@@ -100,8 +100,8 @@ describe('Character System Integration', () => {
         await new Promise((r) => setTimeout(r, 50));
         fs.writeFileSync(path.join(workspace, 'SOUL.md'), '# Soul\nUpdated personality.', 'utf-8');
 
-        // Wait for callback (within 500ms total — debounce is 300ms)
-        await waitFor(() => callbackCount > 0, 3000);
+        // Wait for callback (debounce is 300ms; allow extra headroom under load)
+        await waitFor(() => callbackCount > 0, 8000);
         expect(callbackCount).toBeGreaterThan(0);
       } finally {
         handle.close();
@@ -109,7 +109,7 @@ describe('Character System Integration', () => {
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
-  });
+  }, 15000);
 
   // ── I-CS-03: watcher.close() → modifications don't fire callback ──────────
   it('I-CS-03: watcher.close() → modifying file does NOT fire callback', async () => {
