@@ -646,6 +646,7 @@ const BOT_COMMANDS = [
   { command: 'compact', description: 'Summarize and compress session history' },
   { command: 'stop', description: 'Interrupt the agent and stop current work' },
   { command: 'restart', description: 'Graceful restart session' },
+  { command: 'stats', description: 'Show token usage, cost, and session stats' },
   { command: 'model', description: 'Show current AI model' },
   { command: 'models', description: 'Switch AI model' },
   { command: 'start', description: 'Welcome and setup guide' },

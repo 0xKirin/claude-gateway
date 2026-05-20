@@ -38,7 +38,7 @@ import { ConfigWatcher, ConfigChange } from './config/watcher';
 import { AgentConfig, GatewayConfig } from './types';
 
 function expandTilde(p: string): string {
-  if (p === '~' || p.startsWith('~/')) {
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
     return path.join(os.homedir(), p.slice(1));
   }
   return p;

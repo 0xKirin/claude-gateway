@@ -137,6 +137,8 @@ export interface SessionMeta {
   lastActive: number;
   messageCount: number;
   totalTokensUsed: number;
+  totalInputTokensUsed?: number;
+  totalOutputTokensUsed?: number;
   lastInputTokens?: number;
   loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ MAX_HISTORY_MESSAGES)
   archivedCount?: number;   // messages not loaded into context (older than loaded window)

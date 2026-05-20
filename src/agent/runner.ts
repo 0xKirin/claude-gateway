@@ -825,14 +825,18 @@ export class AgentRunner extends EventEmitter {
       // Track token usage and persist to session meta
       // Use actualSessionId (captured at spawn time) — NOT getActiveSessionId() —
       // so tokens are attributed to the session that owns this process.
-      proc.on('tokenUsage', async ({ inputTokens, totalTokens }: { inputTokens: number; totalTokens: number }) => {
+      proc.on('tokenUsage', async ({ inputTokens, outputTokens, totalTokens }: { inputTokens: number; outputTokens: number; totalTokens: number }) => {
         try {
           const ch = this.channelFor(mapKey);
           const index = await this.sessionStore.listSessions(this.agentConfig.id, mapKey, ch);
           const meta = index.sessions.find(s => s.id === actualSessionId);
           const current = meta?.totalTokensUsed ?? 0;
+          const currentIn = meta?.totalInputTokensUsed ?? 0;
+          const currentOut = meta?.totalOutputTokensUsed ?? 0;
           await this.sessionStore.updateSessionMeta(this.agentConfig.id, mapKey, actualSessionId, {
             totalTokensUsed: current + totalTokens,
+            totalInputTokensUsed: currentIn + inputTokens,
+            totalOutputTokensUsed: currentOut + outputTokens,
             lastInputTokens: inputTokens,
           }, ch);
         } catch {
@@ -886,7 +890,7 @@ export class AgentRunner extends EventEmitter {
    * Returns true if the message content is a session management command.
    */
   private isSessionCommand(content: string): boolean {
-    return /^\/sessions?\b|^\/new(\s|$)|^\/clear\b|^\/compact\b|^\/rename(\s|$)|^\/stop(\s|$)/.test(content);
+    return /^\/sessions?\b|^\/new(\s|$)|^\/clear\b|^\/compact\b|^\/rename(\s|$)|^\/stop(\s|$)|^\/stats\b/.test(content);
   }
 
   /**
@@ -911,6 +915,8 @@ export class AgentRunner extends EventEmitter {
       await this.handleCommandRename(agentId, chatId, name);
     } else if (content.startsWith('/stop')) {
       await this.handleCommandStop(chatId);
+    } else if (content.startsWith('/stats')) {
+      await this.handleCommandStats(agentId, chatId);
     }
   }
 
@@ -982,6 +988,57 @@ export class AgentRunner extends EventEmitter {
     const info = lines.join('\n');
 
     this.writeAutoForward(chatId, info, 'html');
+  }
+
+  /**
+   * /stats — show token usage, cost, and duration for the current session.
+   */
+  private async handleCommandStats(agentId: string, chatId: string): Promise<void> {
+    const data = await this.getSessionStatsData(agentId, chatId);
+    if (!data) {
+      this.writeAutoForward(chatId, 'No active session found.');
+      return;
+    }
+    const { formatSessionStats } = await import('../utils/pricing');
+    this.writeAutoForward(chatId, formatSessionStats(data));
+  }
+
+  /**
+   * Build SessionStatsData for the active session of a chat.
+   * Used by /stats command and REST endpoint.
+   */
+  async getSessionStatsData(agentId: string, chatId: string): Promise<import('../utils/pricing').SessionStatsData | null> {
+    const ch = this.channelFor(chatId);
+    const index = await this.sessionStore.listSessions(agentId, chatId, ch).catch(() => null);
+    const meta = index?.sessions.find(s => s.id === index.activeSessionId);
+    if (!meta) return null;
+
+    const effectiveModel = this.agentConfig.claude.model;
+    const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+    const modelConfig = availableModels.find(m => m.id === effectiveModel);
+    const contextWindow = modelConfig?.contextWindow ?? 200000;
+    const modelLabel = modelConfig?.label ?? effectiveModel;
+
+    const totalInputTokensUsed = meta.totalInputTokensUsed ?? 0;
+    const totalOutputTokensUsed = meta.totalOutputTokensUsed ?? 0;
+
+    const { calculateCost } = await import('../utils/pricing');
+    const estimatedCostUsd = calculateCost(effectiveModel, totalInputTokensUsed, totalOutputTokensUsed);
+
+    return {
+      sessionId: meta.id,
+      sessionName: meta.name,
+      modelId: effectiveModel,
+      modelLabel,
+      contextWindow,
+      lastInputTokens: meta.lastInputTokens ?? 0,
+      totalInputTokensUsed,
+      totalOutputTokensUsed,
+      estimatedCostUsd,
+      durationMs: Date.now() - meta.createdAt,
+      messageCount: meta.messageCount,
+      archivedCount: meta.archivedCount ?? 0,
+    };
   }
 
   /**

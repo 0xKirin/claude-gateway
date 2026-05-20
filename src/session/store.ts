@@ -417,7 +417,7 @@ export class SessionStore {
     agentId: string,
     chatId: string,
     sessionId: string,
-    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn'>>,
+    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'totalInputTokensUsed' | 'totalOutputTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn'>>,
     channel: 'telegram' | 'discord' | 'api' = 'telegram',
   ): Promise<void> {
     const queue = this.getTelegramQueue(agentId, chatId);

@@ -26,7 +26,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node --no-warnings=ExperimentalWarning --env-file-if-exists=.env dist/index.js",
-    "postinstall": "if command -v bun >/dev/null 2>&1; then bun install --cwd mcp; else echo 'Warning: bun not found. Run `cd mcp && bun install` manually to enable MCP tools.'; fi",
+    "postinstall": "node -e \"const{spawnSync}=require('child_process');const r=spawnSync(process.platform==='win32'?'where':'which',['bun'],{stdio:'ignore',shell:true});if(r.status===0){spawnSync('bun',['install'],{cwd:'mcp',stdio:'inherit',shell:true})}else{console.log('Warning: bun not found. Run cd mcp && bun install manually to enable MCP tools.')}\"",
     "test": "jest",
     "test:unit": "jest --testPathPattern=unit",
     "test:e2e": "jest --testPathPattern=tests/e2e --forceExit",

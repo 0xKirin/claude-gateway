@@ -239,6 +239,7 @@ export function createApiRouter(
         { name: '/stop',     description: 'Interrupt the in-flight turn' },
         { name: '/restart',  description: 'Graceful session restart' },
         { name: '/model',    description: 'Show the current AI model' },
+        { name: '/stats',    description: 'Show token usage, cost, and session stats' },
       ],
     });
   });
@@ -1664,6 +1665,26 @@ export function createApiRouter(
       const info = await runner.getApiSessionInfo(chatId, sessionId);
       if (!info) { res.status(404).json({ error: 'Session not found' }); return; }
       res.json(info);
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  /**
+   * GET /api/v1/agents/:agentId/sessions/current/stats
+   * Returns token usage, cost estimate, and duration for the active session.
+   * Requires ?chatId= query param to identify the chat.
+   */
+  router.get('/v1/agents/:agentId/sessions/current/stats', auth, async (req: Request, res: Response) => {
+    const { agentId } = req.params as { agentId: string };
+    const chatId = typeof req.query.chatId === 'string' ? req.query.chatId : undefined;
+    if (!chatId) { res.status(400).json({ error: 'chatId query param is required' }); return; }
+    const runner = agentRunners.get(agentId);
+    if (!runner) { res.status(404).json({ error: 'Agent not found' }); return; }
+    try {
+      const data = await runner.getSessionStatsData(agentId, chatId);
+      if (!data) { res.status(404).json({ error: 'No active session found' }); return; }
+      res.json(data);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
