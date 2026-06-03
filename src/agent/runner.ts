@@ -4,7 +4,7 @@ import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
@@ -13,6 +13,7 @@ import { TelegramReceiver } from '../telegram/receiver';
 import { DiscordReceiver } from '../discord/receiver';
 import { hasMarkdown, toTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
+import { isBuiltinCommand } from './builtin-commands';
 import { HistoryDB } from '../history/db';
 import { MediaStore } from '../history/media-store';
 import { scheduleCleanup, resolveRetentionDays } from '../history/cleanup';
@@ -24,10 +25,11 @@ const DEFAULT_MAX_CONCURRENT = 20;
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
 export const DEFAULT_MODELS: ModelConfig[] = [
-  { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku', contextWindow: 200000 },
+  { id: 'claude-opus-4-8',          label: 'Opus 4.8',   alias: 'opus',   contextWindow: 1000000 },
+  { id: 'claude-opus-4-7',          label: 'Opus 4.7',   alias: 'opus47', contextWindow: 1000000 },
+  { id: 'claude-opus-4-6',          label: 'Opus 4.6',   alias: 'opus46', contextWindow: 1000000 },
+  { id: 'claude-sonnet-4-6',        label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku',  contextWindow: 200000 },
 ];
 
 const PROTECTED_WORKSPACE_FILES = [
@@ -77,7 +79,7 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
   if (imagePaths?.length) {
     imageNote = ` The user attached ${imagePaths.length} image(s). Read them with the Read tool:\n${imagePaths.map(p => `- ${p}`).join('\n')}`;
   }
-  return `[SYSTEM: This is an API request. ${memoryOverride} ${toolNote}${imageNote}]\n`;
+  return `<api-context>This is an API request. ${memoryOverride} ${toolNote}${imageNote}</api-context>\n`;
 }
 
 export class AgentRunner extends EventEmitter {
@@ -116,6 +118,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
+
+  // Buffers attachment file paths registered via api_reply tool for the current API session turn.
+  private readonly pendingApiAttachments = new Map<string, string[]>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -167,6 +172,10 @@ export class AgentRunner extends EventEmitter {
     return this.skillRegistry;
   }
 
+  get workspacePath(): string {
+    return this.agentConfig.workspace;
+  }
+
   /**
    * Bind a local HTTP server that receives POST /channel from TelegramReceiver.
    * Each payload is routed to the appropriate SessionProcess by chat_id.
@@ -206,9 +215,9 @@ export class AgentRunner extends EventEmitter {
           const channelSource = (meta['source'] === 'discord' ? 'discord' : 'telegram') as 'telegram' | 'discord';
           this.channelSourceMap.set(chatId, channelSource);
 
-          // Check if this is a session management command
+          // Check if this is a built-in channel command
           const trimmedContent = content.trim();
-          if (this.isSessionCommand(trimmedContent)) {
+          if (isBuiltinCommand(trimmedContent, channelSource)) {
             this.handleSessionCommand(chatId, trimmedContent)
               .then(() => this.writeTypingDone(chatId))
               .catch((err) => {
@@ -675,6 +684,7 @@ export class AgentRunner extends EventEmitter {
       if (idleEntry) {
         await idleEntry[1].stop();
         this.sessions.delete(idleEntry[0]);
+        this.cleanupApiSessionMediaDir(idleEntry[0], idleEntry[1].source);
         this.logger.info('Evicted idle session', { sessionId: idleEntry[0] });
       } else {
         throw new Error(`Session pool full: ${this.maxConcurrent} concurrent sessions`);
@@ -792,7 +802,11 @@ export class AgentRunner extends EventEmitter {
             // sending a duplicate message to the channel.
             // Skip forwarding when session is in query mode (internal image summary request).
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (resultText.trim() && !proc.queryMode && !replyCalled) {
+            // Suppress the corrupted-thinking 400: the session auto-respawns to recover,
+            // so the raw API error must not reach the user's chat or the history DB.
+            const isThinkingCorruption =
+              obj['is_error'] === true && SessionProcess.isThinkingCorruptionError(resultText);
+            if (resultText.trim() && !proc.queryMode && !replyCalled && !isThinkingCorruption) {
               const text = resultText.trim();
               const channelSrcForResult = this.channelSourceMap.get(mapKey) ?? 'telegram';
               // Persist assistant reply to permanent history DB
@@ -891,6 +905,10 @@ export class AgentRunner extends EventEmitter {
    */
   private isSessionCommand(content: string): boolean {
     return /^\/sessions?\b|^\/new(\s|$)|^\/clear\b|^\/compact\b|^\/rename(\s|$)|^\/stop(\s|$)|^\/stats\b/.test(content);
+  }
+
+  static isApiBuiltinCommand(content: string): boolean {
+    return isBuiltinCommand(content, 'api');
   }
 
   /**
@@ -1297,6 +1315,7 @@ export class AgentRunner extends EventEmitter {
           this.logger.info('Stopping idle session', { sessionId: id });
           await proc.stop();
           this.sessions.delete(id);
+          this.cleanupApiSessionMediaDir(id, proc.source);
         }
       }
     }, 5 * 60 * 1000);
@@ -1380,8 +1399,12 @@ export class AgentRunner extends EventEmitter {
     }
     this.cancelCleanup?.();
     this.cancelCleanup = null;
-    this.callbackServer?.close();
-    this.callbackServer = null;
+    if (this.callbackServer) {
+      const srv = this.callbackServer;
+      this.callbackServer = null;
+      srv.closeAllConnections?.();
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
     this.receiver?.stop();
     this.discordReceiver?.stop();
     await Promise.all([...this.sessions.values()].map((s) => s.stop()));
@@ -1431,8 +1454,8 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
-  ): Promise<string> {
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
+  ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
         new Error(`Session ${sessionId} already has a pending request`),
@@ -1441,9 +1464,8 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    // Register session in api-{chatId} index.json on first use
-    const internalChatIdForSession = `api-${chatId}`;
-    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch((err: unknown) => {
+    // Register session in api-{chatId} index.json on first use (store adds channel prefix internally)
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, chatId, sessionId).catch((err: unknown) => {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
 
@@ -1459,24 +1481,29 @@ export class AgentRunner extends EventEmitter {
     // (same pattern as Telegram — Claude Code reads files via Read tool instead of base64 inline)
     const imagePaths = finalMediaFiles?.length ? this.resolveMediaPaths(finalMediaFiles) : [];
 
-    // Persist user message
-    const apiUserTs = Date.now();
-    await this.sessionStore
-      .appendMessage(this.agentConfig.id, sessionId, {
+    // skipUserMessage omits the trigger from both session context and history so only the
+    // assistant response is visible — intentional for system-initiated messages (e.g. cron welcome).
+    // Claude still receives the prompt via channelXml for this turn; session restarts will not
+    // replay it, which is the desired behaviour for one-shot proactive messages.
+    if (!opts.skipUserMessage) {
+      const apiUserTs = Date.now();
+      await this.sessionStore
+        .appendMessage(this.agentConfig.id, sessionId, {
+          role: 'user',
+          content: message,
+          ts: apiUserTs,
+        })
+        .catch(() => {});
+      this.historyDb.insertMessage({
+        chatId: `api-${chatId}`,
+        sessionId,
+        source: 'api',
         role: 'user',
         content: message,
+        mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
         ts: apiUserTs,
-      })
-      .catch(() => {});
-    this.historyDb.insertMessage({
-      chatId: `api-${chatId}`,
-      sessionId,
-      source: 'api',
-      role: 'user',
-      content: message,
-      mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
-      ts: apiUserTs,
-    });
+      });
+    }
 
     this.pendingApiSessions.add(sessionId);
     session.touch();
@@ -1508,7 +1535,7 @@ export class AgentRunner extends EventEmitter {
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ text: string; attachments: ApiAttachment[] }>((resolve, reject) => {
       const buffer: string[] = [];
       let quietTimer: ReturnType<typeof setTimeout> | undefined;
       // Track partial message text for delta computation (--include-partial-messages)
@@ -1516,6 +1543,7 @@ export class AgentRunner extends EventEmitter {
 
       const done = (result: string) => {
         cleanup();
+        const attachments = this.popApiAttachments(sessionId);
         // Persist assistant reply
         if (result.trim()) {
           const apiAssistantTs = Date.now();
@@ -1535,7 +1563,7 @@ export class AgentRunner extends EventEmitter {
             ts: apiAssistantTs,
           });
         }
-        resolve(result.trim());
+        resolve({ text: result.trim(), attachments });
       };
 
       const fail = (err: Error) => {
@@ -1587,7 +1615,10 @@ export class AgentRunner extends EventEmitter {
           // result event = end of turn
           if (obj['type'] === 'result') {
             session.setProcessing(false);
-            const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+            // Use || instead of ?? so an empty-string result falls back to the
+            // accumulated buffer (needed for non-Anthropic models e.g. OpenRouter,
+            // which emit result:"" even though the text arrived via stream_event chunks).
+            const resultText = (obj['result'] as string | undefined) || buffer.join('');
             done(resultText);
           }
         } catch {
@@ -1621,10 +1652,10 @@ export class AgentRunner extends EventEmitter {
     message: string,
     callbacks: {
       onChunk: (event: StreamEvent) => void;
-      onDone: (fullText: string) => void;
+      onDone: (fullText: string, attachments: ApiAttachment[]) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1634,9 +1665,8 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    // Register session in api-{chatId} index.json on first use
-    const internalChatIdStream = `api-${chatId}`;
-    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch((err: unknown) => {
+    // Register session in api-{chatId} index.json on first use (store adds channel prefix internally)
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, chatId, sessionId).catch((err: unknown) => {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
 
@@ -1651,24 +1681,25 @@ export class AgentRunner extends EventEmitter {
     // Resolve media files to absolute paths for file-path based image passing
     const imagePathsStream = finalMediaFilesStream?.length ? this.resolveMediaPaths(finalMediaFilesStream) : [];
 
-    // Persist user message
-    const streamUserTs = Date.now();
-    await this.sessionStore
-      .appendMessage(this.agentConfig.id, sessionId, {
+    if (!opts.skipUserMessage) {
+      const streamUserTs = Date.now();
+      await this.sessionStore
+        .appendMessage(this.agentConfig.id, sessionId, {
+          role: 'user',
+          content: message,
+          ts: streamUserTs,
+        })
+        .catch(() => {});
+      this.historyDb.insertMessage({
+        chatId: `api-${chatId}`,
+        sessionId,
+        source: 'api',
         role: 'user',
         content: message,
+        mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
         ts: streamUserTs,
-      })
-      .catch(() => {});
-    this.historyDb.insertMessage({
-      chatId: `api-${chatId}`,
-      sessionId,
-      source: 'api',
-      role: 'user',
-      content: message,
-      mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
-      ts: streamUserTs,
-    });
+      });
+    }
 
     this.pendingApiSessions.add(sessionId);
     session.touch();
@@ -1677,11 +1708,14 @@ export class AgentRunner extends EventEmitter {
     let settled = false;
     // Track partial message text for delta computation (--include-partial-messages)
     let lastPartialText = '';
+    // Accumulate tool_use blocks from stream_event (content_block_start → delta → stop)
+    const toolBlocks = new Map<number, { id: string; name: string; chunks: string[] }>();
 
     const done = (result: string) => {
       if (settled) return;
       settled = true;
       cleanup();
+      const attachments = this.popApiAttachments(sessionId);
       // Persist assistant reply
       if (result.trim()) {
         const streamAssistantTs = Date.now();
@@ -1701,7 +1735,7 @@ export class AgentRunner extends EventEmitter {
           ts: streamAssistantTs,
         });
       }
-      callbacks.onDone(result.trim());
+      callbacks.onDone(result.trim(), attachments);
     };
 
     const fail = (err: Error) => {
@@ -1748,20 +1782,13 @@ export class AgentRunner extends EventEmitter {
           }
         }
 
-        // stream_event from --output-format stream-json
-        // Format: {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}}
-        if (obj['type'] === 'stream_event') {
-          const event = obj['event'] as Record<string, unknown> | undefined;
-          if (event?.['type'] === 'content_block_delta') {
-            const delta = event['delta'] as Record<string, unknown> | undefined;
-            if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string' && delta['text']) {
-              buffer.push(delta['text']);
-              // Update lastPartialText so the final 'assistant' message won't re-send the full text
-              lastPartialText += delta['text'];
-              callbacks.onChunk({ type: 'text_delta', text: delta['text'] });
-            }
-          }
-        }
+        // stream_event from --output-format stream-json (tool_use + text_delta)
+        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+          buffer.push(text);
+          // Update lastPartialText so the final 'assistant' message won't re-send the full text
+          lastPartialText += text;
+          callbacks.onChunk({ type: 'text_delta', text });
+        });
 
         // Text from delta field (other formats)
         if (obj['type'] !== 'assistant' && obj['type'] !== 'text' && obj['type'] !== 'result' && obj['type'] !== 'stream_event') {
@@ -1770,16 +1797,6 @@ export class AgentRunner extends EventEmitter {
             buffer.push(deltaText);
             callbacks.onChunk({ type: 'text_delta', text: deltaText });
           }
-        }
-
-        // Tool use
-        if (obj['type'] === 'tool_use') {
-          callbacks.onChunk({
-            type: 'tool_use',
-            name: (obj['name'] as string) ?? '',
-            id: (obj['id'] as string) ?? '',
-            input: (obj['input'] as Record<string, unknown>) ?? {},
-          });
         }
 
         // Thinking
@@ -1794,7 +1811,8 @@ export class AgentRunner extends EventEmitter {
         if (obj['type'] === 'result') {
           session.setProcessing(false);
           lastPartialText = ''; // reset for next turn
-          const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+          // Use || so empty-string result falls back to buffer (OpenRouter emits result:"").
+          const resultText = (obj['result'] as string | undefined) || buffer.join('');
           done(resultText);
         }
       } catch {
@@ -1855,6 +1873,44 @@ export class AgentRunner extends EventEmitter {
     return this.pendingApiSessions.has(sessionId);
   }
 
+  /**
+   * Register file paths as attachments for the current API session turn.
+   * Called by the api_reply MCP tool via the attachments endpoint.
+   * Files must be absolute paths within the agent's media directory.
+   */
+  addApiAttachments(sessionId: string, filePaths: string[]): void {
+    const existing = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.set(sessionId, [...existing, ...filePaths]);
+  }
+
+  /**
+   * Pop and return buffered attachment paths for a session, then clear the buffer.
+   * Converts absolute paths to relative media URLs for the API response.
+   */
+  popApiAttachments(sessionId: string): ApiAttachment[] {
+    const paths = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.delete(sessionId);
+    const mediaRoot = path.join(this.agentsBaseDir, this.agentConfig.id, 'media') + path.sep;
+    return paths
+      .map((absPath): ApiAttachment | null => {
+        if (!absPath.startsWith(mediaRoot)) return null;
+        if (!fs.existsSync(absPath)) return null;
+        const rel = absPath.slice(mediaRoot.length).replace(/\\/g, '/');
+        return { type: 'image', url: `/v1/agents/${encodeURIComponent(this.agentConfig.id)}/media/${rel}` };
+      })
+      .filter((a): a is ApiAttachment => a !== null);
+  }
+
+  private cleanupApiSessionMediaDir(sessionId: string, source: string): void {
+    if (source !== 'api') return;
+    const mediaDir = path.join(this.agentsBaseDir, this.agentConfig.id, 'media', `api-${sessionId}`);
+    try {
+      fs.rmSync(mediaDir, { recursive: true, force: true });
+    } catch {
+      // best-effort — log nothing, just don't crash the cleaner
+    }
+  }
+
   getAgentsBaseDir(): string {
     return this.agentsBaseDir;
   }
@@ -1877,7 +1933,8 @@ export class AgentRunner extends EventEmitter {
 
   async executeApiCommand(sessionId: string, chatId: string, command: string): Promise<Record<string, unknown>> {
     const agentId = this.agentConfig.id;
-    const internalChatId = `api-${chatId}`;
+    const storeChatId = chatId;           // sessionStore adds channel prefix internally
+    const dbChatId = `api-${chatId}`;    // historyDb uses full channel-chatId key
 
     if (command === '/model') {
       return { model: this.agentConfig.claude.model };
@@ -1895,7 +1952,7 @@ export class AgentRunner extends EventEmitter {
     }
 
     if (command === '/session') {
-      const index = await this.sessionStore.listSessions(agentId, internalChatId, 'api').catch(() => null);
+      const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
       const meta = index?.sessions.find((s) => s.id === sessionId);
       const effectiveModel = this.agentConfig.claude.model;
       if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
@@ -1915,15 +1972,15 @@ export class AgentRunner extends EventEmitter {
 
     if (command === '/clear') {
       const ch = 'api' as const;
-      await this.sessionStore.clearTelegramSessionHistory(agentId, internalChatId, sessionId, ch);
-      await this.sessionStore.updateSessionMeta(agentId, internalChatId, sessionId, {
+      await this.sessionStore.clearTelegramSessionHistory(agentId, storeChatId, sessionId, ch);
+      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
         totalTokensUsed: 0,
         lastInputTokens: 0,
         archivedCount: 0,
         loadedAtSpawn: undefined,
         messageCountAtSpawn: undefined,
       }, ch);
-      const mediaPaths = this.historyDb.clearSession(internalChatId, sessionId);
+      const mediaPaths = this.historyDb.clearSession(dbChatId, sessionId);
       MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
       this.restartProcess(sessionId).catch(() => {});
       return { success: true };
@@ -1936,8 +1993,8 @@ export class AgentRunner extends EventEmitter {
       const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
       const contextWindow = modelConfig?.contextWindow ?? 200000;
       const compactor = new SessionCompactor(this.sessionStore);
-      const result = await compactor.compact(agentId, internalChatId, sessionId, compactEffectiveModel, contextWindow, ch);
-      await this.sessionStore.updateSessionMeta(agentId, internalChatId, sessionId, {
+      const result = await compactor.compact(agentId, storeChatId, sessionId, compactEffectiveModel, contextWindow, ch);
+      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
         loadedAtSpawn: undefined,
         archivedCount: undefined,
         messageCountAtSpawn: undefined,
@@ -1950,10 +2007,8 @@ export class AgentRunner extends EventEmitter {
   }
 
   async setModel(newModel: string): Promise<void> {
-    const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-    if (!availableModels.find((m) => m.id === newModel)) {
-      throw Object.assign(new Error(`Unknown model: ${newModel}`), { code: 'UNKNOWN_MODEL' });
-    }
+    // Allow any model string through — BYOK/third-party models (openrouter/* etc.)
+    // are validated by the upstream provider, not the local config list.
     this.agentConfig.claude.model = newModel;
     try { this.persistModelToConfig(newModel); } catch (err) {
       this.logger.error('Failed to persist model to config', { error: (err as Error).message });
@@ -1961,7 +2016,7 @@ export class AgentRunner extends EventEmitter {
   }
 
   async listApiSessions(chatId: string): Promise<import('../types').SessionIndex> {
-    return this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api');
+    return this.sessionStore.listSessions(this.agentConfig.id, chatId, 'api');
   }
 
   async createApiSession(chatId: string, prompt?: string, name?: string): Promise<import('../types').SessionMeta> {
@@ -1982,11 +2037,11 @@ export class AgentRunner extends EventEmitter {
         sessionName = undefined;
       }
     }
-    return this.sessionStore.createTelegramSession(this.agentConfig.id, `api-${chatId}`, sessionName, 'api');
+    return this.sessionStore.createTelegramSession(this.agentConfig.id, chatId, sessionName, 'api');
   }
 
   async getApiSessionInfo(chatId: string, sessionId: string): Promise<Record<string, unknown> | null> {
-    const index = await this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api').catch(() => null);
+    const index = await this.sessionStore.listSessions(this.agentConfig.id, chatId, 'api').catch(() => null);
     const meta = index?.sessions.find((s) => s.id === sessionId);
     if (!meta) return null;
     const effectiveModel = this.agentConfig.claude.model;
@@ -2006,25 +2061,23 @@ export class AgentRunner extends EventEmitter {
 
   async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string }): Promise<{ sessionId: string; sessionName?: string }> {
     if (updates.sessionName) {
-      const internalChatId = `api-${chatId}`;
       // Ensure session exists in the file index (may be missing for older sessions stored only in SQLite)
-      await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatId, sessionId).catch((err: unknown) => {
+      await this.sessionStore.ensureApiSession(this.agentConfig.id, chatId, sessionId).catch((err: unknown) => {
         this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
       });
-      await this.sessionStore.updateSessionMeta(this.agentConfig.id, internalChatId, sessionId, { name: updates.sessionName }, 'api');
+      await this.sessionStore.updateSessionMeta(this.agentConfig.id, chatId, sessionId, { name: updates.sessionName }, 'api');
     }
     return { sessionId, ...(updates.sessionName ? { sessionName: updates.sessionName } : {}) };
   }
 
   async deleteApiSession(chatId: string, sessionId: string): Promise<void> {
-    const internalChatId = `api-${chatId}`;
-    await this.sessionStore.deleteTelegramSession(this.agentConfig.id, internalChatId, sessionId, 'api').catch((err: unknown) => {
+    await this.sessionStore.deleteTelegramSession(this.agentConfig.id, chatId, sessionId, 'api').catch((err: unknown) => {
       // Legacy sessions (stored only in SQLite, no file index entry) are treated as already deleted
       if (err instanceof SessionNotInIndexError) return;
       throw err;
     });
     // Purge from SQLite so the session no longer appears in listSessions()
-    const mediaPaths = this.historyDb.clearSession(internalChatId, sessionId);
+    const mediaPaths = this.historyDb.clearSession(`api-${chatId}`, sessionId);
     MediaStore.deleteMediaFiles(this.agentsBaseDir, this.agentConfig.id, mediaPaths);
   }
 
@@ -2073,6 +2126,7 @@ export class AgentRunner extends EventEmitter {
     const buffer: string[] = [];
     let settled = false;
     let lastPartialText = '';
+    const toolBlocks = new Map<number, { id: string; name: string; chunks: string[] }>();
 
     const done = (result: string) => {
       if (settled) return;
@@ -2133,9 +2187,17 @@ export class AgentRunner extends EventEmitter {
           const text = (obj['text'] as string) ?? '';
           if (text) { buffer.push(text); callbacks.onChunk({ type: 'text_delta', text }); }
         }
+        // stream_event from --output-format stream-json (tool_use + text_delta)
+        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+          buffer.push(text);
+          // Update lastPartialText so the final 'assistant' message won't re-send the full text
+          lastPartialText += text;
+          callbacks.onChunk({ type: 'text_delta', text });
+        });
         if (obj['type'] === 'result') {
           session.setProcessing(false);
-          const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+          // Use || so empty-string result falls back to buffer (OpenRouter emits result:"").
+          const resultText = (obj['result'] as string | undefined) || buffer.join('');
           done(resultText);
         }
       } catch { /* non-JSON */ }
@@ -2158,6 +2220,49 @@ export class AgentRunner extends EventEmitter {
     return () => {
       if (!settled) { settled = true; cleanup(); }
     };
+  }
+
+  private _applyStreamEvent(
+    obj: Record<string, unknown>,
+    toolBlocks: Map<number, { id: string; name: string; chunks: string[] }>,
+    onChunk: (event: StreamEvent) => void,
+    onTextDelta: (text: string) => void,
+  ): void {
+    if (obj['type'] !== 'stream_event') return;
+    const event = obj['event'] as Record<string, unknown> | undefined;
+    const index = event?.['index'] as number | undefined;
+
+    if (event?.['type'] === 'content_block_start') {
+      const cb = event['content_block'] as Record<string, unknown> | undefined;
+      if (cb?.['type'] === 'tool_use' && index !== undefined) {
+        toolBlocks.set(index, {
+          id: (cb['id'] as string) ?? '',
+          name: (cb['name'] as string) ?? '',
+          chunks: [],
+        });
+      }
+    }
+
+    if (event?.['type'] === 'content_block_delta') {
+      const delta = event['delta'] as Record<string, unknown> | undefined;
+      if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string' && delta['text']) {
+        onTextDelta(delta['text']);
+      }
+      if (delta?.['type'] === 'input_json_delta' && index !== undefined) {
+        toolBlocks.get(index)?.chunks.push((delta['partial_json'] as string) ?? '');
+      }
+    }
+
+    if (event?.['type'] === 'content_block_stop' && index !== undefined) {
+      const block = toolBlocks.get(index);
+      if (block) {
+        toolBlocks.delete(index);
+        try {
+          const input = JSON.parse(block.chunks.join('') || '{}') as Record<string, unknown>;
+          onChunk({ type: 'tool_use', name: block.name, id: block.id, input });
+        } catch { /* malformed tool input JSON — skip */ }
+      }
+    }
   }
 
   /**

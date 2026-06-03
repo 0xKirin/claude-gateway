@@ -12,6 +12,12 @@ export interface AgentConfig {
   description: string;
   workspace: string;
   env: string;
+  /** 'app-agent' = docker-exec based agent installed from an app store app */
+  type?: 'app-agent';
+  /** Docker container name — required when type === 'app-agent' */
+  container?: string;
+  /** Absolute path to the claude binary mounted inside the container */
+  claudeBin?: string;
   telegram?: {
     botToken: string;
   };
@@ -150,11 +156,16 @@ export interface SessionIndex {
   sessions: SessionMeta[];
 }
 
+export type ApiAttachment = {
+  type: 'image';
+  url: string;
+};
+
 export type StreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'tool_use'; name: string; id: string; input?: Record<string, unknown> }
   | { type: 'thinking'; text: string }
-  | { type: 'result'; text: string }
+  | { type: 'result'; text: string; attachments?: ApiAttachment[] }
   | { type: 'error'; message: string };
 
 export interface Logger {

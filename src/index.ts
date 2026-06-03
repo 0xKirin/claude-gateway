@@ -26,7 +26,7 @@ import { loadConfig } from './config/loader';
 import { detectMigration, applyMigration, loadCleanTemplate } from './config/migrator';
 import { loadWorkspace, watchWorkspace, migrateWorkspaceFiles } from './agent/workspace-loader';
 import { watchSkills } from './skills';
-import { syncSharedSkills } from './skills/sync';
+import { syncSharedSkills, syncModuleSkills } from './skills/sync';
 import { createWatcher } from './watch/factory';
 import { AgentRunner } from './agent/runner';
 import { CronScheduler } from './cron/scheduler';
@@ -36,6 +36,12 @@ import { ContextIsolationGuard } from './agent/context-isolation';
 import { createLogger } from './logger';
 import { ConfigWatcher, ConfigChange } from './config/watcher';
 import { AgentConfig, GatewayConfig } from './types';
+import { AppsRegistry } from './apps/registry';
+import { RegistryClient } from './apps/registry-client';
+import { AppInstaller } from './apps/installer';
+import { AgentManager } from './apps/agent-manager';
+import { SocketServer, parseTimeoutMs } from './apps/socket-server';
+import { parseAppYaml, AppYamlService, AppYamlScript } from './apps/compose-generator';
 
 function expandTilde(p: string): string {
   if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
@@ -194,6 +200,24 @@ async function startAgent(
     }
   }
 
+  // ── Create stub workspace files if missing (e.g. freshly-installed app-agents) ──
+  const WORKSPACE_STUBS: Record<string, string> = {
+    'AGENTS.md': `# Agent: ${agentConfig.id}\n`,
+    'SOUL.md': '',
+    'MEMORY.md': '',
+  };
+  for (const [filename, content] of Object.entries(WORKSPACE_STUBS)) {
+    const filePath = path.join(agentConfig.workspace, filename);
+    if (!fs.existsSync(filePath)) {
+      try {
+        fs.writeFileSync(filePath, content, 'utf-8');
+        logger.info(`Created stub ${filename}`);
+      } catch (err) {
+        logger.warn(`Failed to create stub ${filename}`, { error: (err as Error).message });
+      }
+    }
+  }
+
   // ── Per-agent workspace validation (fail fast per-agent, not whole gateway) ──
   const validation = validateWorkspaceFast(agentConfig.workspace);
   if (!validation.ok) {
@@ -328,6 +352,44 @@ async function startAgent(
   startupResults.push({ id: agentConfig.id, status: 'started', workspace: agentConfig.workspace });
 }
 
+async function restoreSockets(registry: AppsRegistry, socketServer: SocketServer): Promise<void> {
+  const apps = await registry.list();
+  for (const app of apps) {
+    if (app.status !== 'running') continue;
+    if (Object.keys(app.sockets).length === 0) continue;
+
+    const yamlPath = path.join(app.installPath, 'app.yaml');
+    if (!fs.existsSync(yamlPath)) continue;
+
+    let appYaml: ReturnType<typeof parseAppYaml>;
+    try {
+      appYaml = parseAppYaml(fs.readFileSync(yamlPath, 'utf-8'), app.installPath);
+    } catch {
+      continue;
+    }
+
+    for (const [svcName, sockPath] of Object.entries(app.sockets)) {
+      const svc = appYaml.services[svcName] as AppYamlService | undefined;
+      if (!svc?.gateway_api) continue;
+
+      try { fs.unlinkSync(sockPath); } catch { /* stale or absent */ }
+      fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+
+      socketServer.start(sockPath, {
+        appName: app.name,
+        serviceName: svcName,
+        appDir: app.installPath,
+        scripts: Object.fromEntries(
+          Object.entries(svc.gateway_api.scripts ?? {}).map(([name, s]: [string, AppYamlScript]) => [
+            name,
+            { path: s.path, timeoutMs: parseTimeoutMs(s.timeout), args: s.args },
+          ]),
+        ),
+      });
+    }
+  }
+}
+
 async function main(): Promise<void> {
   // Load agent .env files before config interpolation so ${TOKEN} vars resolve
   const gatewayAgentsDir = path.join(path.dirname(CONFIG_PATH), 'agents');
@@ -375,9 +437,12 @@ async function main(): Promise<void> {
   const sharedSkillsDir = path.join(os.homedir(), '.claude-gateway', 'shared-skills');
   const personalSkillsDir = path.join(os.homedir(), '.claude', 'skills');
   const globalLogger = createLogger('gateway', expandTilde(config.gateway.logDir));
+  const mcpToolsDir = path.resolve(__dirname, '..', 'mcp', 'tools');
+  const logDir = expandTilde(config.gateway.logDir);
 
-  // Initial sync: copy shared skills to ~/.claude/skills/ so the Skill tool sees them
+  // Initial sync: copy shared and module skills to ~/.claude/skills/ so the Skill tool sees them
   syncSharedSkills(sharedSkillsDir, personalSkillsDir, globalLogger);
+  syncModuleSkills(mcpToolsDir, personalSkillsDir, globalLogger);
 
   // Watch shared-skills for changes and re-sync to ~/.claude/skills/ on any update
   createWatcher({
@@ -389,8 +454,15 @@ async function main(): Promise<void> {
     },
   });
 
-  const mcpToolsDir = path.resolve(__dirname, '..', 'mcp', 'tools');
-  const logDir = expandTilde(config.gateway.logDir);
+  // Watch module skills for changes and re-sync to ~/.claude/skills/
+  createWatcher({
+    paths: [`${mcpToolsDir}/**/skills/**/SKILL.md`],
+    debounceMs: 250,
+    chokidarOpts: { depth: 4 },
+    onChange: () => {
+      syncModuleSkills(mcpToolsDir, personalSkillsDir, globalLogger);
+    },
+  });
 
   // Start persistent cron manager (needed before startAgent so hot-added agents can reference it)
   const cronManager = new CronManager(
@@ -424,10 +496,102 @@ async function main(): Promise<void> {
   // Print startup summary table
   printStartupTable(startupResults);
 
+  // ── App store components ─────────────────────────────────────────────────
+  const appsConfigPath = path.join(path.dirname(CONFIG_PATH), 'apps.json');
+  const appsRegistry = new AppsRegistry(appsConfigPath);
+  const registryClient = new RegistryClient();
+  const agentManager = new AgentManager(CONFIG_PATH, path.join(path.dirname(CONFIG_PATH), 'agents'));
+  const socketServer = new SocketServer();
+
+  // Callbacks that bridge installer events to the router (filled in after router is created)
+  const installerCallbacks = {
+    registerRoutes: (_appName: string, _ports: import('./apps/compose-generator').ComposePort[]) => {
+      // No-op until router is ready; router.loadProxyRoutes() handles startup restore
+    },
+    deregisterRoutes: (_appName: string) => {},
+    startSocket: (_socketPath: string, _socket: import('./apps/compose-generator').ComposeSocket, _scripts: Record<string, import('./apps/installer').ScriptConfig>, _appDir: string) => Promise.resolve(),
+    stopSockets: (_appName: string) => {},
+    reinitializeAgent: async (agentName: string) => {
+      const runner = ctx.agentRunners.get(agentName);
+      const agentConfig = ctx.agentConfigs.get(agentName);
+      if (!runner || !agentConfig) return; // first install — agent.added will call startAgent
+      const logger = createLogger(agentName, ctx.logDir);
+      try {
+        const updated = await loadWorkspace(agentConfig.workspace, {
+          mcpToolsDir: ctx.mcpToolsDir,
+          sharedSkillsDir: ctx.sharedSkillsDir,
+          logger,
+        });
+        const claudeMdPath = path.join(agentConfig.workspace, 'CLAUDE.md');
+        await fs.promises.writeFile(claudeMdPath, updated.systemPrompt, 'utf8');
+        logger.info('Rewrote CLAUDE.md after reinstall', { chars: updated.systemPrompt.length });
+        if (updated.skillRegistry) {
+          runner.setSkillRegistry(updated.skillRegistry);
+        }
+      } catch (err) {
+        logger.error('Failed to reinitialize agent workspace after reinstall', { error: (err as Error).message });
+      }
+    },
+  };
+
+  const appInstaller = new AppInstaller(
+    appsRegistry,
+    registryClient,
+    installerCallbacks,
+    undefined,
+    undefined,
+    agentManager,
+  );
+
   // Start gateway router
-  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config, cronManager, CONFIG_PATH);
+  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config, cronManager, CONFIG_PATH, appsRegistry, appInstaller, registryClient);
   await router.start(PORT);
   console.log(`[gateway] Listening on port ${PORT}`);
+
+  // Wire installer callbacks now that the router is available
+  installerCallbacks.registerRoutes = (appName, ports) => {
+    for (const port of ports) {
+      router.registerProxyRoute(appName, port.name, port.hostPort, port.type, port.rateLimit);
+    }
+  };
+  installerCallbacks.deregisterRoutes = (appName) => {
+    router.deregisterProxyRoutes(appName);
+  };
+  installerCallbacks.startSocket = (socketPath, socket, scripts, appDir) => {
+    return socketServer.start(socketPath, {
+      appName: socket.service.split('-')[0] ?? 'unknown',
+      serviceName: socket.service,
+      appDir,
+      scripts: Object.fromEntries(
+        Object.entries(scripts).map(([name, s]) => [
+          name,
+          {
+            path: s.path,
+            timeoutMs: parseTimeoutMs(s.timeout),
+            args: s.args,
+          },
+        ]),
+      ),
+    });
+  };
+  installerCallbacks.stopSockets = (appName) => {
+    socketServer.stopApp(appName);
+  };
+
+  // Restore proxy routes, sockets, and agent entries for apps that were running before restart
+  try {
+    await router.loadProxyRoutes(appsRegistry);
+    await restoreSockets(appsRegistry, socketServer);
+    const reconcileErrors = await agentManager.reconcileAgents(appsRegistry);
+    if (reconcileErrors.length > 0) {
+      for (const e of reconcileErrors) {
+        globalLogger.warn(`App store: reconcile failed for "${e.app}": ${e.error}`);
+      }
+    }
+    globalLogger.info('App store: proxy routes, sockets, and agent entries restored');
+  } catch (err) {
+    globalLogger.warn('App store: startup restore failed (non-fatal)', { error: (err as Error).message });
+  }
 
   // ── Config hot-reload watcher ──────────────────────────────────────────────
   const configWatcher = new ConfigWatcher(CONFIG_PATH, config, globalLogger);
@@ -535,6 +699,7 @@ async function main(): Promise<void> {
 
     cronManager.stop();
     configWatcher.stop();
+    socketServer.stopAll();
 
     await router.stop();
 

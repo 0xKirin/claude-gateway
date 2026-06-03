@@ -19,6 +19,8 @@ import { SkillsModule } from './tools/skills/module';
 import { AgentModule } from './tools/agent/module';
 import { BrowserModule } from './tools/browser/module';
 import { SessionModule } from './tools/session/module';
+import { AppsModule } from './tools/apps/module';
+import { ApiModule } from './tools/api/module';
 import type { ChannelModule, ToolModule, McpToolDefinition } from './types';
 
 const ORIGIN_CHANNEL = process.env.GATEWAY_ORIGIN_CHANNEL ?? '';
@@ -37,6 +39,8 @@ const modules: AnyModule[] = [
   new AgentModule(),
   new BrowserModule(),
   new SessionModule(),
+  new AppsModule(),
+  new ApiModule(),
 ];
 
 // Build tool-to-module mapping for enabled modules

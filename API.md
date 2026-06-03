@@ -26,6 +26,7 @@ All API endpoints require an API key configured in `config.json`. Pass it via:
 | `PATCH` | `/api/v1/agents/:agentId` | Write | Update agent description, model, or allow_tools |
 | `DELETE` | `/api/v1/agents/:agentId` | Admin | Delete an agent |
 | `POST` | `/api/v1/agents/:agentId/messages` | Key | Send a message — sync JSON or SSE stream; supports slash commands |
+| `POST` | `/api/v1/agents/:agentId/greeting` | Write | Stream a proactive welcome from `GREETING.md` into an existing session (SSE); returns 204 if file absent |
 | `GET` | `/api/v1/models` | Key | List all supported Claude models |
 | `PUT` | `/api/v1/agents/:agentId/model` | Admin | Set the active model for an agent |
 
@@ -45,6 +46,7 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/compact` | Key | Summarise old history, keep only recent messages |
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/stop` | Key | Interrupt the in-flight turn |
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/restart` | Key | Graceful session restart |
+| `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/attachments` | Key | Register file paths as attachments for the current turn (called internally by `api_reply` MCP tool) |
 
 ### Workspace File API
 
@@ -52,6 +54,19 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 |--------|------|------|-------------|
 | `GET` | `/api/v1/agents/:agentId/files/:filename` | Key | Read a workspace file |
 | `PUT` | `/api/v1/agents/:agentId/files/:filename` | Write | Write a workspace file |
+
+### Telegram Channel API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/agents/:agentId/telegram/pending` | Admin | List pending pairing requests |
+| `POST` | `/api/v1/agents/:agentId/telegram/approve` | Admin | Approve a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/deny` | Admin | Deny a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/init-pairing` | Admin | Write sentinel — next DM auto-approves as owner |
+| `GET` | `/api/v1/agents/:agentId/telegram/pairing-status` | Admin | Check sentinel status + current allowlist |
+| `PATCH` | `/api/v1/agents/:agentId/telegram/policy` | Admin | Update DM policy |
+| `GET` | `/api/v1/agents/:agentId/telegram/allowlist` | Admin | List allowlisted users |
+| `DELETE` | `/api/v1/agents/:agentId/telegram/allow/:userId` | Admin | Remove a user from the allowlist |
 
 ### Skill API
 
@@ -62,6 +77,24 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `POST` | `/api/v1/agents/:agentId/skills` | Write | Create a new skill |
 | `POST` | `/api/v1/agents/:agentId/skills/install` | Admin | Install a skill from a GitHub/raw URL |
 | `DELETE` | `/api/v1/agents/:agentId/skills/:name` | Write | Delete a skill |
+
+### App Store API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/apps/registry` | Key | Fetch community registry (5-min cached) |
+| `GET` | `/api/v1/apps/registry/:name` | Key | Get versions of a registry app |
+| `GET` | `/api/v1/apps` | Key | List installed apps |
+| `POST` | `/api/v1/apps/install` | Admin | Start async install → `jobId` |
+| `GET` | `/api/v1/apps/jobs/:jobId` | Key | Poll install/update job status + logs |
+| `GET` | `/api/v1/apps/:name` | Key | Get installed app info |
+| `DELETE` | `/api/v1/apps/:name` | Admin | Uninstall app |
+| `POST` | `/api/v1/apps/:name/start` | Admin | Start stopped app |
+| `POST` | `/api/v1/apps/:name/stop` | Admin | Stop running app |
+| `POST` | `/api/v1/apps/:name/restart` | Admin | Restart app |
+| `GET` | `/api/v1/apps/:name/version` | Key | Check installed vs latest version |
+| `POST` | `/api/v1/apps/:name/update` | Admin | Start async update with rollback → `jobId` |
+| `GET` | `/app/:name/:portName/*` | None | Reverse proxy to installed app |
 
 ### Cron API
 
@@ -293,12 +326,12 @@ Update an agent's description, model, or allow_tools flag. Requires write access
 curl -X PATCH \
   -H "X-Api-Key: admin-key-456" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-opus-4-7"}' \
+  -d '{"model": "claude-opus-4-8"}' \
   http://localhost:10850/api/v1/agents/alfred | jq
 ```
 
 ```json
-{ "agent": { "id": "alfred", "description": "Personal assistant", "model": "claude-opus-4-7", "allow_tools": false } }
+{ "agent": { "id": "alfred", "description": "Personal assistant", "model": "claude-opus-4-8", "allow_tools": false } }
 ```
 
 ---
@@ -543,6 +576,222 @@ curl -X DELETE \
 
 ---
 
+## Telegram Channel API
+
+Manage Telegram access control per agent — pending pairings, allowlist, and DM policy. All endpoints require an **admin** key.
+
+### Endpoints Overview
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/agents/:agentId/telegram/pending` | Admin | List pending (non-expired) pairing requests |
+| `POST` | `/api/v1/agents/:agentId/telegram/approve` | Admin | Approve a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/deny` | Admin | Deny and remove a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/init-pairing` | Admin | Write sentinel so next DM auto-approves as owner |
+| `GET` | `/api/v1/agents/:agentId/telegram/pairing-status` | Admin | Check whether init-pairing sentinel is active |
+| `PATCH` | `/api/v1/agents/:agentId/telegram/policy` | Admin | Update the DM policy |
+| `GET` | `/api/v1/agents/:agentId/telegram/allowlist` | Admin | List all users in the allowlist |
+| `DELETE` | `/api/v1/agents/:agentId/telegram/allow/:userId` | Admin | Remove a user from the allowlist |
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/pending
+
+List all pending (non-expired) Telegram pairing requests for an agent. Expired entries are cleaned up automatically on this call.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/pending | jq
+```
+
+```json
+{
+  "pending": [
+    {
+      "code": "A3F9C1",
+      "senderId": "123456789",
+      "chatId": "123456789",
+      "createdAt": 1775737709000,
+      "expiresAt": 1775738309000
+    }
+  ]
+}
+```
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/approve
+
+Approve a pending pairing by its 6-character code. The sender's `chatId` is added to `allowFrom` in `access.json`.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `code` | Yes | 6-character pairing code |
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "A3F9C1"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/approve | jq
+```
+
+```json
+{ "ok": true, "senderId": "123456789" }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `code` missing |
+| 404 | Code not found or expired |
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/deny
+
+Deny and remove a pending pairing request by code.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `code` | Yes | 6-character pairing code |
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "A3F9C1"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/deny | jq
+```
+
+```json
+{ "ok": true }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `code` missing |
+| 404 | Code not found |
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/init-pairing
+
+Write a sentinel file so the **next** private message to the bot is auto-approved as the owner. Sentinel expires after 10 minutes.
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/init-pairing | jq
+```
+
+```json
+{ "ok": true }
+```
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/pairing-status
+
+Check whether the init-pairing sentinel is still active (i.e. waiting for the first DM). Also returns the current allowlist.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/pairing-status | jq
+```
+
+```json
+{ "waiting": true, "allowFrom": [] }
+```
+
+`waiting` is `false` if the sentinel has expired or does not exist.
+
+---
+
+### PATCH /api/v1/agents/:agentId/telegram/policy
+
+Update the DM policy for the agent's Telegram channel.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `dmPolicy` | Yes | One of `open`, `pairing`, `allowlist`, `disabled` |
+
+```bash
+curl -X PATCH \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"dmPolicy": "allowlist"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/policy | jq
+```
+
+```json
+{ "ok": true, "dmPolicy": "allowlist" }
+```
+
+**Policy values:**
+
+| Value | Behaviour |
+|-------|-----------|
+| `open` | Any Telegram user can message the bot |
+| `pairing` | Users must complete a pairing flow first |
+| `allowlist` | Only users in `allowFrom` can message the bot |
+| `disabled` | No messages accepted |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `dmPolicy` missing or invalid value |
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/allowlist
+
+Return all users in the `allowFrom` list for the agent's Telegram channel.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/allowlist | jq
+```
+
+```json
+{ "allowFrom": ["123456789", "987654321"] }
+```
+
+---
+
+### DELETE /api/v1/agents/:agentId/telegram/allow/:userId
+
+Remove a user from the `allowFrom` list. `:userId` must be a numeric Telegram user ID.
+
+```bash
+curl -X DELETE \
+  -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/allow/123456789 | jq
+```
+
+```json
+{ "ok": true }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `userId` is not numeric |
+| 404 | Agent not found |
+
+---
+
 ### POST /api/v1/agents/:agentId/messages
 
 Send a message to an agent. Returns a JSON response or SSE stream.
@@ -559,6 +808,7 @@ Send a message to an agent. Returns a JSON response or SSE stream.
 | `stream` | No | `true` to enable SSE streaming (default `false`) |
 | `timeout_ms` | No | Override the default response timeout in milliseconds (default 60000) |
 | `media_files` | No | Array of `mediaPath` strings returned by the Media Upload endpoint |
+| `store_user_message` | No | Set to `false` to skip persisting the user message in session history — only the assistant response is stored. Requires a write or admin key. Useful for proactive/trigger prompts where the user trigger should be invisible. |
 
 #### Slash command dispatch
 
@@ -603,9 +853,14 @@ curl -X POST \
   "agent_id": "alfred",
   "response": "Hello! I'm Alfred, your personal assistant. I can help you with...",
   "session_id": "da19d84a-6a36-4f57-b419-d322d82c4db8",
-  "duration_ms": 2341
+  "duration_ms": 2341,
+  "attachments": [
+    { "type": "image", "url": "/v1/agents/alfred/media/api-sess-id/browser_shot_default_1234567890.jpg" }
+  ]
 }
 ```
+
+> `attachments` is only present when the agent captured images during the turn (e.g. via `browser_screenshot`). Each entry has `type: "image"` and a `url` that can be fetched via `GET /api/v1/agents/:agentId/media/*`.
 
 **Continue a session:**
 
@@ -656,6 +911,8 @@ data: {"type":"tool_use","name":"Read","id":"toolu_abc123"}
 data: {"type":"text_delta","text":"Here's the explanation..."}
 data: {"type":"result","text":"Here's the full explanation...","request_id":"550e8400-...","session_id":"abc-123","duration_ms":4200}
 data: [DONE]
+
+> When images are captured during the turn, the `result` event also includes `"attachments": [{"type":"image","url":"..."}]`.
 ```
 
 ### Requests with tool use
@@ -687,7 +944,7 @@ Regardless of `allow_tools`, the agent will not create or update workspace ident
 | `text_delta` | `text` | Incremental text chunk |
 | `tool_use` | `name`, `id` | Tool invocation (e.g. Read, Grep, Bash) |
 | `thinking` | `text` | Agent reasoning (if available) |
-| `result` | `text`, `request_id`, `session_id`, `duration_ms` | Final aggregated result |
+| `result` | `text`, `request_id`, `session_id`, `duration_ms`, `attachments?` | Final aggregated result; `attachments` present only when images were captured |
 | `error` | `message` | Error event |
 
 The stream ends with `data: [DONE]`.
@@ -708,8 +965,9 @@ curl -H "X-Api-Key: my-secret-key-123" \
 ```json
 {
   "models": [
-    { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "alias": "sonnet", "contextWindow": 200000, "multiplier": 1 },
-    { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "alias": "opus", "contextWindow": 200000, "multiplier": 3 }
+    { "id": "claude-opus-4-8", "name": "Claude Opus 4.8", "alias": "opus",   "contextWindow": 1000000, "multiplier": 3 },
+    { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "alias": "opus47", "contextWindow": 1000000, "multiplier": 3 },
+    { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "alias": "sonnet", "contextWindow": 1000000, "multiplier": 1 }
   ]
 }
 ```
@@ -724,18 +982,18 @@ Set the active model for a specific agent. Persists to `config.json`. Requires a
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | Yes | Claude model ID (e.g. `"claude-opus-4-7"`) |
+| `model` | Yes | Claude model ID (e.g. `"claude-opus-4-8"`) |
 
 ```bash
 curl -X PUT \
   -H "X-Api-Key: admin-key-456" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-opus-4-7"}' \
+  -d '{"model": "claude-opus-4-8"}' \
   http://localhost:10850/api/v1/agents/alfred/model | jq
 ```
 
 ```json
-{ "model": "claude-opus-4-7" }
+{ "model": "claude-opus-4-8" }
 ```
 
 **Error responses:**
@@ -755,6 +1013,63 @@ Manage API sessions for a specific agent and `chat_id`. Sessions are stored at `
 **`chat_id`** identifies the caller. Use any stable string (e.g. `"myapp"`, `"user-123"`, `"getpod"`). It is **required** on all session endpoints — pass it as:
 - Query string for `GET` and `DELETE` requests: `?chat_id=myapp`
 - Request body for `POST` and `PATCH` requests: `{"chat_id": "myapp", ...}`
+
+---
+
+### POST /api/v1/agents/:agentId/greeting
+
+Stream a proactive welcome into an **existing** session. The endpoint reads `GREETING.md` from the agent's workspace and sends its content to the agent as a trigger prompt via SSE. Only the **assistant response** is stored in session history — the trigger prompt is invisible (uses `store_user_message: false` internally).
+
+Returns `204 No Content` if `GREETING.md` does not exist or is empty.
+
+**Auth:** Write or Admin key required.
+
+**Two-step flow:**
+
+1. Create the session first: `POST /api/v1/agents/:agentId/sessions` → redirect the user to the chat UI with the returned `session_id`.
+2. Once in the chat UI, trigger the greeting: `POST /api/v1/agents/:agentId/greeting` with `session_id` → stream the assistant's opening message as SSE with typing animation visible to the user.
+
+**Request:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `session_id` | Yes | ID of an existing session to deliver the greeting into |
+| `chat_id` | No | Same `chat_id` used when the session was created; ensures the greeting message is stored in the correct history bucket. Defaults to `session_id` when omitted (creates a secondary index entry) |
+
+```bash
+curl -N -X POST \
+  -H "X-Api-Key: my-write-key" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "7f3a1c2d-89ab-4def-b012-345678901234"}' \
+  http://localhost:10850/api/v1/agents/getpod/greeting
+```
+
+**Response `200` (SSE stream)** — greeting is streaming:
+
+```
+data: {"type":"text_delta","text":"Hello! "}
+data: {"type":"text_delta","text":"Welcome to GetPod."}
+data: {"type":"result","text":"Hello! Welcome to GetPod.","session_id":"7f3a1c2d-..."}
+data: [DONE]
+```
+
+If the session has an active request in flight, the endpoint returns `409` before sending SSE headers.
+
+**Response `204`** — `GREETING.md` not found or empty; nothing sent to session.
+
+**`GREETING.md` format:**
+
+Place the file at `~/.claude-gateway/agents/{agentId}/workspace/GREETING.md`. Its content is used as the prompt sent to the agent. It is **not** concatenated into the agent system prompt — it is a one-time trigger only.
+
+```markdown
+The user's environment is ready. Send a warm, concise welcome message
+introducing yourself and what you can help with.
+```
+
+**Notes:**
+- `GREETING.md` is **deleted before streaming begins**. Subsequent calls return 204 immediately, making the endpoint idempotent. Re-provisioning `GREETING.md` enables a new greeting on the next call.
+- The SSE stream format matches `POST /messages` with `stream: true` — use the same client-side handler.
+- If the agent errors mid-stream, an `{"type":"error","message":"..."}` SSE event is sent and the stream closes.
 
 ---
 
@@ -849,13 +1164,13 @@ Rename a session.
 | Field | Required | Description |
 |-------|----------|-------------|
 | `chat_id` | Yes | Caller identity |
-| `sessionName` | Yes | New session name |
+| `session_name` | Yes | New session name (snake_case preferred; `sessionName` also accepted for backward compatibility) |
 
 ```bash
 curl -X PATCH \
   -H "X-Api-Key: my-secret-key-123" \
   -H "Content-Type: application/json" \
-  -d '{"chat_id": "myapp", "sessionName": "Q3 Infra Discussion"}' \
+  -d '{"chat_id": "myapp", "session_name": "Q3 Infra Discussion"}' \
   http://localhost:10850/api/v1/agents/alfred/sessions/da19d84a | jq
 ```
 
@@ -865,6 +1180,10 @@ curl -X PATCH \
   "sessionName": "Q3 Infra Discussion"
 }
 ```
+
+**Notes:**
+- Request body accepts `session_name` (snake_case, preferred) or `sessionName` (camelCase, backward compatibility). When both are present, `session_name` takes priority.
+- The response body always uses camelCase (`sessionName`), consistent with all other API responses.
 
 ---
 
@@ -1813,6 +2132,478 @@ curl -H "X-Api-Key: my-secret-key-123" \
 | 400 | Path traversal attempt or invalid path |
 | 403 | Key has no access to agent |
 | 404 | Agent or file not found |
+
+---
+
+## App Store API
+
+Manage Docker-compose apps installed on the gateway. Apps can be sourced from the community registry or a custom GitHub repository.
+
+**Auth levels:** All App Store endpoints require API key auth. Write operations (install, update, uninstall, start/stop/restart) require an **admin** key.
+
+**Proxy routes:** Installed apps are exposed at `/app/:name/:portName/*` (no auth required at proxy layer — authentication is handled by each app).
+
+---
+
+### Endpoints Overview
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/apps/registry` | Key | Fetch community registry (5-min cached) |
+| `GET` | `/api/v1/apps/registry/:name` | Key | Get versions of a specific registry app |
+| `GET` | `/api/v1/apps` | Key | List all installed apps |
+| `POST` | `/api/v1/apps/install` | Admin | Start async install → returns `jobId` |
+| `GET` | `/api/v1/apps/jobs/:jobId` | Key | Poll install/update job status + logs |
+| `GET` | `/api/v1/apps/:name` | Key | Get installed app info |
+| `DELETE` | `/api/v1/apps/:name` | Admin | Uninstall app (docker down + cleanup) |
+| `POST` | `/api/v1/apps/:name/start` | Admin | Start stopped app |
+| `POST` | `/api/v1/apps/:name/stop` | Admin | Stop running app |
+| `POST` | `/api/v1/apps/:name/restart` | Admin | Restart app |
+| `GET` | `/api/v1/apps/:name/version` | Key | Check current + latest version |
+| `POST` | `/api/v1/apps/:name/update` | Admin | Start async update with rollback → returns `jobId` |
+
+---
+
+### GET /api/v1/apps/registry
+
+Fetch the community registry (cached 5 minutes, falls back to stale on network failure).
+
+```bash
+curl -H "X-Api-Key: my-key" http://localhost:10850/api/v1/apps/registry | jq
+```
+
+```json
+{
+  "updated_at": "2026-05-19T00:00:00.000Z",
+  "apps": [
+    {
+      "name": "agent-note",
+      "description": "Note-taking app with AI agent",
+      "repo": "https://github.com/0xMaxMa/app-agent-note",
+      "author": "0xMaxMa",
+      "versions": [
+        { "version": "1.0.0", "commit": "abc123def456abc123def456abc123def456abc1", "approved_at": "2026-05-01T00:00:00.000Z" }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### GET /api/v1/apps/registry/:name
+
+Get all versions of a specific app from the community registry.
+
+```bash
+curl -H "X-Api-Key: my-key" http://localhost:10850/api/v1/apps/registry/agent-note | jq
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 404 | App not found in registry |
+| 502 | Registry fetch failed |
+
+---
+
+### GET /api/v1/apps
+
+List all installed apps and their status.
+
+```bash
+curl -H "X-Api-Key: my-key" http://localhost:10850/api/v1/apps | jq
+```
+
+```json
+{
+  "apps": [
+    {
+      "name": "agent-note",
+      "version": "1.0.0",
+      "commit": "abc123def456abc123def456abc123def456abc1",
+      "githubUrl": "https://github.com/0xMaxMa/app-agent-note",
+      "installPath": "/home/user/.claude-gateway/apps/agent-note",
+      "ports": [{ "name": "web", "service": "app", "containerPort": 4000, "type": "web", "rateLimit": 200 }],
+      "sockets": {},
+      "installedAt": "2026-05-19T10:00:00.000Z",
+      "updatedAt": "2026-05-19T10:00:00.000Z",
+      "status": "running",
+      "source": "registry"
+    }
+  ]
+}
+```
+
+**`status` values:** `running` | `stopped` | `error` | `building`
+
+**`source` values:** `registry` | `custom` | `local`
+
+---
+
+### POST /api/v1/apps/install
+
+Start an asynchronous install job. Returns immediately with a `jobId` to poll.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `registry_app` | One of | App name from community registry |
+| `version` | No | Specific version from registry (default: latest) |
+| `github_url` | One of | GitHub repo URL — must be `https://github.com/<owner>/<repo>` (no other hosts accepted) |
+| `commit` | If `github_url` | 40-char hex commit SHA (branch names not accepted). Omit to auto-resolve HEAD. |
+| `local_path` | One of | Absolute path to local project dir (dev mode — symlinked, source never deleted) |
+| `env_vars` | No | Pre-supplied env vars as a JSON **object** (not array). Keys must match vars declared in `app.yaml`. |
+
+**Mode A — registry install:**
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"registry_app": "agent-note"}' \
+  http://localhost:10850/api/v1/apps/install | jq
+```
+
+**Mode A — registry install with specific version:**
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"registry_app": "agent-note", "version": "1.0.0"}' \
+  http://localhost:10850/api/v1/apps/install | jq
+```
+
+**Mode B — custom GitHub repo:**
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "github_url": "https://github.com/myorg/my-app",
+    "commit": "abc123def456abc123def456abc123def456abc1",
+    "env_vars": { "DATABASE_URL": "postgres://..." }
+  }' \
+  http://localhost:10850/api/v1/apps/install | jq
+```
+
+**Mode C — local dev (symlink):**
+
+Use when developing an app locally. Creates a symlink `~/.claude-gateway/apps/{name}` → your project directory instead of cloning. The full install pipeline (validate, compose, build, start) runs the same as other modes. Uninstalling removes only the symlink — your source directory is never touched.
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"local_path": "/home/dev/projects/my-app"}' \
+  http://localhost:10850/api/v1/apps/install | jq
+```
+
+After editing source, restart the app to pick up changes:
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  http://localhost:10850/api/v1/apps/my-app/restart | jq
+```
+
+```json
+{ "jobId": "550e8400-e29b-41d4-a716-446655440000" }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | Missing required fields, invalid commit format, invalid `github_url` format, `env_vars` not an object, or path does not exist |
+| 403 | Not an admin key |
+
+> Poll `GET /api/v1/apps/jobs/:jobId` to track progress. Install pipeline: clone/symlink → validate `app.yaml` → generate compose → build images → start containers → register proxy routes. On failure, container logs are appended to `logs` before rollback.
+
+---
+
+### GET /api/v1/apps/jobs/:jobId
+
+Poll the status of an async install or update job.
+
+```bash
+curl -H "X-Api-Key: my-key" \
+  http://localhost:10850/api/v1/apps/jobs/550e8400-e29b-41d4-a716-446655440000 | jq
+```
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "logs": [
+    "[2026-05-19T10:00:01.000Z] Cloning https://github.com/0xMaxMa/app-agent-note",
+    "[2026-05-19T10:00:05.000Z] Checked out commit abc123de",
+    "[2026-05-19T10:00:06.000Z] Validating app.yaml",
+    "[2026-05-19T10:00:07.000Z] Generating docker-compose.yml",
+    "[2026-05-19T10:00:07.000Z] Building images",
+    "[2026-05-19T10:00:45.000Z] Starting containers",
+    "[2026-05-19T10:00:50.000Z] Containers healthy",
+    "[2026-05-19T10:00:50.000Z] Install complete: {\"web\":\"/app/agent-note/web/\"}"
+  ],
+  "result": {
+    "appName": "agent-note",
+    "proxyUrls": { "web": "/app/agent-note/web/" },
+    "secretKeys": ["DATABASE_URL"],
+    "agentDeclaration": null
+  },
+  "startedAt": 1747648800000,
+  "updatedAt": 1747648850000
+}
+```
+
+**`status` values:** `pending` | `running` | `completed` | `failed`
+
+When `status` is `failed`, `error` contains the failure message. If the containers started but failed the healthcheck, container logs are appended to `logs` before rollback:
+
+```json
+{
+  "id": "...",
+  "status": "failed",
+  "logs": [
+    "[2026-05-19T10:00:45.000Z] Starting containers",
+    "[2026-05-19T10:00:47.000Z]   my-app  | 2026/05/19 10:00:46 API_KEY is required",
+    "[2026-05-19T10:00:47.000Z]   my-app  | 2026/05/19 10:00:47 API_KEY is required",
+    "[2026-05-19T10:00:47.000Z] Build/start failed — rolling back"
+  ],
+  "error": "Command failed: docker compose — container my-app is unhealthy",
+  "startedAt": 1747648845000,
+  "updatedAt": 1747648847000
+}
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 404 | Job ID not found |
+
+---
+
+### GET /api/v1/apps/:name
+
+Get info for an installed app.
+
+```bash
+curl -H "X-Api-Key: my-key" \
+  http://localhost:10850/api/v1/apps/agent-note | jq
+```
+
+Returns the full `AppEntry` object (same shape as items in `GET /api/v1/apps`).
+
+---
+
+### DELETE /api/v1/apps/:name
+
+Uninstall an app: `docker compose down --rmi all`, remove proxy routes, sockets, agent entry, and app files.
+
+```bash
+curl -X DELETE \
+  -H "X-Api-Key: admin-key" \
+  http://localhost:10850/api/v1/apps/agent-note | jq
+```
+
+```json
+{ "deleted": true, "name": "agent-note" }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 403 | Not an admin key |
+| 404 | App not installed |
+
+---
+
+### POST /api/v1/apps/:name/start|stop|restart
+
+Start, stop, or restart an installed app's containers.
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  http://localhost:10850/api/v1/apps/agent-note/restart | jq
+```
+
+```json
+{ "name": "agent-note", "action": "restart" }
+```
+
+---
+
+### GET /api/v1/apps/:name/version
+
+Check the currently installed version vs latest in the registry. Only meaningful for `source: "registry"` apps.
+
+```bash
+curl -H "X-Api-Key: my-key" \
+  http://localhost:10850/api/v1/apps/agent-note/version | jq
+```
+
+```json
+{
+  "installed": "1.0.0",
+  "installed_commit": "abc123def456abc123def456abc123def456abc1",
+  "latest": "1.1.0",
+  "latest_commit": "def456abc123def456abc123def456abc123def4",
+  "behind": true,
+  "updateable": true
+}
+```
+
+For custom/local apps, `latest` and `latest_commit` are `null` and `updateable` is `false`.
+
+---
+
+### POST /api/v1/apps/:name/update
+
+Start an async update to the latest registry version. Uses blue/green swap: build new version in `/tmp/`, stop old containers, start new, swap directories, rollback automatically if new containers fail health check.
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key" \
+  http://localhost:10850/api/v1/apps/agent-note/update | jq
+```
+
+```json
+{ "jobId": "661f9511-f30c-52e5-b827-557766551111" }
+```
+
+Poll the returned `jobId` with `GET /api/v1/apps/jobs/:jobId` to track progress.
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | App source is `custom` or `local` (cannot be updated via this endpoint) |
+| 403 | Not an admin key |
+| 404 | App not installed |
+
+---
+
+### App Proxy
+
+Installed apps with `ports` declared in their `app.yaml` are accessible at:
+
+```
+/app/:appName/:portName/*
+```
+
+No gateway auth is required — apps handle their own authentication. Rate limiting is applied per-port as declared in `app.yaml` (`rate_limit` field, default 200 req/s).
+
+Both `:appName` and `:portName` must match `[a-z0-9][a-z0-9-]{1,63}` — requests with names outside this pattern are rejected with `400`.
+
+```
+# Example: web app on port 4000 with portName "web"
+http://localhost:10850/app/agent-note/web/
+
+# Example: API on port 3000 with portName "api"
+http://localhost:10850/app/getpod-manager/api/v1/metrics
+```
+
+**Port type behaviour:**
+
+| Type | Path behaviour |
+|------|---------------|
+| `api` | Strips `/app/:name/:portName` prefix before forwarding |
+| `web` | Preserves full original URL path (required for SPAs) |
+
+---
+
+### app.yaml Reference
+
+Every installable app must include an `app.yaml` at the repository root.
+
+**Minimal example:**
+
+```yaml
+apiVersion: "1.0"
+name: my-app
+version: "1.0.0"
+commit: "abc123def456abc123def456abc123def456abc1"
+description: "My application"
+
+services:
+  app:
+    build: .
+    ports:
+      - name: web
+        container: 4000
+        type: web
+        rate_limit: 200
+```
+
+**Full field reference:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `apiVersion` | Yes | Always `"1.0"` |
+| `name` | Yes | App slug `[a-z0-9][a-z0-9-]{1,63}` |
+| `version` | Yes | Semantic version |
+| `commit` | Yes | Pinned commit SHA |
+| `description` | No | Human-readable description |
+| `resources.cpu` | No | CPU limit (default 1.0, max 4.0) |
+| `resources.memory` | No | Memory limit e.g. `"256M"`, `"1G"` (max 2G) |
+| `services.<name>` | Yes | One or more service definitions |
+| `services.agent` | No | Agent service declaration (see below) |
+
+**Service fields:**
+
+| Field | Description |
+|-------|-------------|
+| `build` | Relative path to Dockerfile directory |
+| `image` | Docker image (mutually exclusive with `build`) |
+| `command` | Override container command |
+| `entrypoint` | Override container entrypoint |
+| `environment` | Static env vars (`KEY=value`) or secret keys (`KEY` without `=`) |
+| `volumes` | Volume mounts (named volumes or host paths within app dir) |
+| `ports` | Array of port declarations (see below) |
+| `depends_on` | Service dependency list |
+| `healthcheck` | Docker healthcheck (test, interval, timeout, retries) |
+| `gateway_api` | Host script bridge via Unix socket (see below) |
+
+**Banned fields:** `network_mode: host`, `privileged`, `cap_add`. The gateway always injects `cap_drop: ALL`, `restart: unless-stopped`, `env_file: .env`, and resource limits.
+
+**Agent service declaration:**
+
+```yaml
+services:
+  agent:
+    path: ./agent      # relative path to agent workspace within repo
+    name: my-agent     # agent ID, must match [a-z][a-z0-9-]{1,63}
+```
+
+When declared, the gateway injects a `debian:stable-slim` container, mounts the claude CLI and node binaries, and registers the agent in `config.json`. Messages to this agent are dispatched via `docker exec`.
+
+**Host script bridge (`gateway_api`):**
+
+```yaml
+services:
+  app:
+    gateway_api:
+      socket: /var/run/gateway.sock
+      scripts:
+        resize-disk:
+          path: scripts/resize-disk.sh
+          timeout: 60s
+          args:
+            - name: size_gb
+              type: string
+              pattern: "^\\d+$"
+```
+
+The gateway mounts a **directory** (not a socket file) into the container. This means the socket file (`gateway.sock` inside that directory) is stable across gateway restarts — the container's bind mount points to the directory inode, so it always sees the latest socket.
+
+The container connects to `http+unix://<socket>/tool/script/<name>` and POST `{"args": {"size_gb": "20"}}` to invoke a declared script. The gateway only exposes `PATH` and `HOME` to scripts.
+
+**Request body limit:** 1 MB. Requests larger than this are rejected with `413`.
+
+**Arg validation:** Each argument is validated against its declared `pattern` (compiled once at socket startup, not per request). Values exceeding 256 characters are rejected.
 
 ---
 

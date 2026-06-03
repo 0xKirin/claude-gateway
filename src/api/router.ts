@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { AgentRunner, DEFAULT_MODELS } from '../agent/runner';
-import { AgentConfig, ApiKey, ModelConfig } from '../types';
+import { AgentConfig, ApiKey, ModelConfig, SessionMeta } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
 import { HistoryDB } from '../history/db';
@@ -278,8 +278,9 @@ export function createApiRouter(
       timeout_ms?: unknown;
       media_files?: unknown;
       model?: unknown;
+      store_user_message?: unknown;
     };
-    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel } = body;
+    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ error: 'message is required and must be a non-empty string' });
@@ -326,16 +327,19 @@ export function createApiRouter(
       validatedMediaFiles = media_files as string[];
     }
 
-    // Validate model if provided — always reject unknown models (fail closed)
-    const modelStr = typeof requestModel === 'string' ? requestModel.trim() : undefined;
-    if (modelStr) {
-      const availableModels = models ?? DEFAULT_MODELS;
-      if (!availableModels.find((m: ModelConfig) => m.id === modelStr)) {
-        res.status(400).json({ error: `Unknown model: ${modelStr}` });
-        return;
-      }
+    if (store_user_message !== undefined && typeof store_user_message !== 'boolean') {
+      res.status(400).json({ error: 'store_user_message must be a boolean if provided' });
+      return;
+    }
+    const skipUserMessage = store_user_message === false;
+    if (skipUserMessage && !apiKey.write && !apiKey.admin) {
+      res.status(403).json({ error: 'store_user_message: false requires a write or admin API key' });
+      return;
     }
 
+    // Allow any model string — BYOK/third-party models (e.g. openrouter/*) are validated
+    // by the upstream provider, not the local config list.
+    const modelStr = typeof requestModel === 'string' ? requestModel.trim() : undefined;
     const requestId = randomUUID();
     const sessionId = (session_id as string | undefined) ?? randomUUID();
     const chatIdStr = (chat_id as string).trim();
@@ -345,8 +349,8 @@ export function createApiRouter(
         ? timeout_ms
         : DEFAULT_TIMEOUT_MS;
 
-    // Slash command dispatch — runs instead of sending to Claude
-    if (message.trim().startsWith('/')) {
+    // Built-in command dispatch — only intercept known commands, let everything else reach Claude
+    if (AgentRunner.isApiBuiltinCommand(message.trim())) {
       try {
         const result = await runner.executeApiCommand(sessionId, chatIdStr, message.trim());
         res.json({ command: message.trim(), session_id: sessionId, result });
@@ -364,9 +368,11 @@ export function createApiRouter(
           onChunk: (event: import('../types').StreamEvent) => {
             try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch { /* client gone */ }
           },
-          onDone: (fullText: string) => {
+          onDone: (fullText: string, attachments: import('../types').ApiAttachment[]) => {
             try {
-              res.write(`data: ${JSON.stringify({ type: 'result', text: fullText, request_id: requestId, session_id: sessionId, duration_ms: Date.now() - startTime })}\n\n`);
+              const resultEvent: Record<string, unknown> = { type: 'result', text: fullText, request_id: requestId, session_id: sessionId, duration_ms: Date.now() - startTime };
+              if (attachments.length) resultEvent['attachments'] = attachments;
+              res.write(`data: ${JSON.stringify(resultEvent)}\n\n`);
               res.write('data: [DONE]\n\n');
               res.end();
             } catch { /* client gone */ }
@@ -401,7 +407,7 @@ export function createApiRouter(
           chatIdStr,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage },
         );
 
         // Client disconnect -> cleanup
@@ -426,19 +432,22 @@ export function createApiRouter(
       try {
         const agentCfgSync = agentConfigs.get(agentId)!;
         const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
-        const response = await runner.sendApiMessage(sessionId, chatIdStr, message.trim(), {
+        const { text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, message.trim(), {
           timeoutMs,
           allowTools: allowToolsSync,
           mediaFiles: validatedMediaFiles,
           model: modelStr,
+          skipUserMessage,
         });
-        res.json({
+        const syncResult: Record<string, unknown> = {
           request_id: requestId,
           agent_id: agentId,
-          response,
+          response: responseText,
           session_id: sessionId,
           duration_ms: Date.now() - startTime,
-        });
+        };
+        if (attachments.length) syncResult['attachments'] = attachments;
+        res.json(syncResult);
       } catch (err: unknown) {
         const code = (err as { code?: string }).code;
         if (code === 'TIMEOUT') {
@@ -1595,6 +1604,50 @@ export function createApiRouter(
   });
 
   /**
+   * POST /api/v1/agents/:agentId/sessions/:sessionId/attachments
+   * Register file paths as attachments for the current API session turn.
+   * Called by the api_reply MCP tool from within the agent subprocess.
+   * Body: { files: string[] }  — absolute file paths within the agent's media directory.
+   */
+  router.post(
+    '/v1/agents/:agentId/sessions/:sessionId/attachments',
+    auth,
+    (req: Request, res: Response) => {
+      const { agentId, sessionId } = req.params as { agentId: string; sessionId: string };
+      const apiKey = (req as AuthedRequest).apiKey;
+      if (!canAccessAgent(apiKey, agentId)) {
+        res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+        return;
+      }
+      const runner = agentRunners.get(agentId);
+      if (!runner) {
+        res.status(404).json({ error: `Agent '${agentId}' not found` });
+        return;
+      }
+      const body = req.body as Record<string, unknown>;
+      const files = body['files'];
+      if (!Array.isArray(files) || files.some((f) => typeof f !== 'string')) {
+        res.status(400).json({ error: 'files must be an array of strings' });
+        return;
+      }
+      // Validate all paths stay within the agent's media directory
+      const agentsBaseDir = runner.getAgentsBaseDir();
+      const mediaRoot = path.join(agentsBaseDir, agentId, 'media') + path.sep;
+      const validFiles: string[] = [];
+      for (const f of files as string[]) {
+        const real = path.resolve(f);
+        if (!real.startsWith(mediaRoot)) {
+          res.status(400).json({ error: `File path outside media directory: ${f}` });
+          return;
+        }
+        validFiles.push(real);
+      }
+      runner.addApiAttachments(sessionId, validFiles);
+      res.json({ ok: true, count: validFiles.length });
+    },
+  );
+
+  /**
    * POST /api/v1/agents/:agentId/media
    * Upload a media file as raw binary body (image/* or application/pdf).
    * Headers: Content-Type (mime type), X-Filename (optional original filename)
@@ -1770,12 +1823,7 @@ export function createApiRouter(
       await runner.setModel(newModel);
       res.json({ model: newModel });
     } catch (err: unknown) {
-      const code = (err as { code?: string }).code;
-      if (code === 'UNKNOWN_MODEL') {
-        res.status(400).json({ error: `Unknown model: ${newModel}` });
-      } else {
-        res.status(500).json({ error: 'Failed to set model' });
-      }
+      res.status(500).json({ error: 'Failed to set model' });
     }
   });
 
@@ -2018,9 +2066,11 @@ export function createApiRouter(
     if (!ctx) return;
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
-    const body = req.body as { sessionName?: unknown };
-    const sessionName = typeof body.sessionName === 'string' ? body.sessionName.trim() : undefined;
-    if (!sessionName) { res.status(400).json({ error: 'sessionName is required' }); return; }
+    const body = req.body as { session_name?: unknown; sessionName?: unknown };
+    // Accept session_name (preferred, snake_case) or sessionName (camelCase, backward compat)
+    const rawName = body.session_name ?? body.sessionName;
+    const sessionName = typeof rawName === 'string' ? rawName.trim() : undefined;
+    if (!sessionName) { res.status(400).json({ error: 'session_name is required' }); return; }
     try {
       const result = await runner.updateApiSession(chatId, sessionId, { sessionName });
       res.json(result);
@@ -2106,6 +2156,118 @@ export function createApiRouter(
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // POST /api/v1/agents/:agentId/greeting — stream a proactive welcome from GREETING.md into an existing session
+  router.post('/v1/agents/:agentId/greeting', auth, async (req: Request, res: Response) => {
+    const { agentId } = req.params as { agentId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+
+    if (!canWriteAgent(apiKey, agentId)) {
+      res.status(403).json({ error: `greeting requires write or admin access to agent '${agentId}'` });
+      return;
+    }
+
+    const runner = agentRunners.get(agentId);
+    if (!runner) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
+
+    const body = req.body as { session_id?: unknown; chat_id?: unknown };
+    const sessionId = typeof body.session_id === 'string' ? body.session_id.trim() : '';
+    if (!sessionId) {
+      res.status(400).json({ error: 'session_id is required' });
+      return;
+    }
+    // chat_id is optional — provide the same value used when creating the session via POST /sessions
+    // so the greeting message lands in the correct historyDb bucket (api-{chatId}).
+    // If omitted, sessionId is used as the bucket key, which creates a secondary index entry.
+    const chatId = typeof body.chat_id === 'string' && body.chat_id.trim() ? body.chat_id.trim() : sessionId;
+
+    if (runner.hasActiveApiSession(sessionId)) {
+      res.status(409).json({ error: 'Session already has a pending request' });
+      return;
+    }
+
+    const greetingPath = path.join(runner.workspacePath, 'GREETING.md');
+    let content: string;
+    try {
+      content = (await fsp.readFile(greetingPath, 'utf-8')).trim();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        res.status(204).send();
+        return;
+      }
+      res.status(500).json({ error: `Failed to read GREETING.md: ${(err as Error).message}` });
+      return;
+    }
+
+    if (!content) {
+      res.status(204).send();
+      return;
+    }
+
+    // Unlink before streaming — prevents re-read race if the client retries immediately
+    try { await fsp.unlink(greetingPath); } catch (e) {
+      console.error(`[api] Failed to delete GREETING.md for '${agentId}': ${(e as Error).message}`);
+    }
+
+    let cleanup: (() => void) | undefined;
+    try {
+      const sseCallbacks = {
+        onChunk: (event: import('../types').StreamEvent) => {
+          try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch { /* client gone */ }
+        },
+        onDone: (fullText: string) => {
+          try {
+            res.write(`data: ${JSON.stringify({ type: 'result', text: fullText, session_id: sessionId })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          } catch { /* client gone */ }
+        },
+        onError: (err: Error) => {
+          try {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+          } catch { /* client gone */ }
+        },
+      } satisfies Parameters<typeof runner.sendApiMessageStream>[3];
+
+      // Preflight conflict check already done above; throw-based check catches races after headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.flushHeaders();
+      res.socket?.setNoDelay(true);
+
+      cleanup = await runner.sendApiMessageStream(
+        sessionId,
+        chatId,
+        content,
+        sseCallbacks,
+        { timeoutMs: DEFAULT_TIMEOUT_MS, skipUserMessage: true },
+      );
+
+      res.on('close', cleanup);
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code;
+      // res.headersSent is always true here (writeHead is called before sendApiMessageStream),
+      // so the !res.headersSent branches below are kept for parity with the /messages endpoint
+      // pattern — they guard against future code reordering, not any current reachable path.
+      if (!res.headersSent) {
+        if (code === 'CONFLICT') {
+          res.status(409).json({ error: 'Session already has a pending request' });
+        } else {
+          res.status(500).json({ error: (err as Error).message ?? 'Internal error' });
+        }
+      } else {
+        try {
+          res.write(`data: ${JSON.stringify({ type: 'error', message: (err as Error).message ?? 'Internal error' })}\n\n`);
+          res.end();
+        } catch { /* client gone */ }
+      }
     }
   });
 
