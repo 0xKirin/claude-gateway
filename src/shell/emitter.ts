@@ -91,4 +91,5 @@ export class ProtocolEmitter {
       usage: { output_tokens: opts.usage?.output_tokens ?? 0 },
     });
   }
+
 }

@@ -713,8 +713,7 @@ export class SessionProcess extends EventEmitter {
         fs.writeFileSync(statusPath, 'queued');
       } catch {}
     }
-    // If there's a deferred history context (API session model-switch respawn), prepend it
-    // to the first message so Claude sees prior conversation context within the same turn.
+    // Prepend pending API history context if present.
     const fullText = this.pendingInitialPrompt
       ? `${this.pendingInitialPrompt}\n\n${text}`
       : text;

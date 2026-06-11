@@ -17,6 +17,7 @@ import { ScreenModel } from './screen';
 import { PtyHost } from './pty-host';
 import { TranscriptTailer, AssistantRecord, UsageInfo } from './tailer';
 import { ProtocolEmitter } from './emitter';
+import { preTrustWorkspace, checkAuthStatus } from './trust';
 
 const POLL_MS = 200;
 const STARTUP_QUIET_MS = 600;
@@ -86,6 +87,21 @@ class Driver {
   private readonly realBinParts = (process.env.CLAUDE_REAL_BIN ?? 'claude').split(' ');
 
   start(): void {
+    // Fail fast if Claude is not authenticated — avoids getting stuck on a login dialog.
+    const claudeBin = this.realBinParts[0];
+    const auth = checkAuthStatus(claudeBin);
+    if (!auth.loggedIn) {
+      logError('Claude is not authenticated. Run `claude login` on the server before starting the gateway.');
+      this.emitter.emitResult({
+        sessionId: this.args.sessionId, isError: true,
+        text: 'Claude is not authenticated. Please run `claude login` on the server.',
+        durationMs: 0, usage: null,
+      });
+      process.exit(1);
+    }
+    // Pre-trust the workspace so the trust-folder dialog never appears.
+    preTrustWorkspace(process.cwd());
+
     const [realBin, ...realBinArgs] = this.realBinParts;
     logDebug(`session=${this.args.sessionId} bin=${this.realBinParts.join(' ')} args=${this.args.claudeArgs.join(' ')}`);
 
@@ -336,33 +352,16 @@ class Driver {
     if (SKIP_DIALOG_DISMISS) return;
     const now = Date.now();
     if (now - this.lastDialogActionAt < DIALOG_ACTION_COOLDOWN_MS) return;
-    if (this.screen.quietMs() < 500) return; // wait until the dialog is fully drawn
+    if (this.screen.quietMs() < 500) return;
     const dialog = this.screen.detectDialog();
     if (!dialog) return;
     this.lastDialogActionAt = now;
 
-    switch (dialog) {
-      case 'bypass-permissions':
-        // --dangerously-skip-permissions is built into the wrapper, so the
-        // confirmation dialog is always accepted on the operator's behalf.
-        logWarn('accepting Bypass Permissions dialog (per built-in --dangerously-skip-permissions)');
-        this.host.writeRaw('2');
-        break;
-      case 'trust-folder':
-        // The gateway only ever runs claude in its own agent workspaces.
-        logWarn('accepting workspace trust dialog');
-        this.host.writeRaw('\r');
-        break;
-      case 'unknown-select':
-        if (!this.turn) break;
-        this.turn.dialogEscapes++;
-        logError(`unexpected dialog during turn (escape ${this.turn.dialogEscapes}/2):\n${this.screen.text()}`);
-        if (this.turn.dialogEscapes <= 2) {
-          this.host.writeRaw('\x1b');
-        } else {
-          this.finishTurn(true, 'blocked by an unexpected TUI dialog');
-        }
-        break;
+    if (dialog === 'bypass-permissions') {
+      // --dangerously-skip-permissions is built into the wrapper, so the
+      // confirmation dialog is always accepted on the operator's behalf.
+      logWarn('accepting Bypass Permissions dialog (per built-in --dangerously-skip-permissions)');
+      this.host.writeRaw('2');
     }
   }
 

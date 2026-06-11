@@ -4,10 +4,11 @@ import {
   ScreenModel,
   TUI_BUSY_MARKER,
   TUI_BYPASS_PERMS,
-  TUI_TRUST_FOLDER,
-  TUI_CONFIRM_MARKER,
 } from '../../src/shell/screen';
+import { preTrustWorkspace, checkAuthStatus } from '../../src/shell/trust';
 import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
 
 describe('pty-shell translateArgs', () => {
   const GATEWAY_ARGS = [
@@ -94,13 +95,6 @@ describe('ScreenModel TUI constants (Claude Code v2.1.x)', () => {
     expect(TUI_BYPASS_PERMS).toContain('Yes, I accept');
   });
 
-  it('TRUST_FOLDER matches expected dialog text', () => {
-    expect(TUI_TRUST_FOLDER).toBe('Do you trust the files in this folder');
-  });
-
-  it('CONFIRM_MARKER matches expected dialog text', () => {
-    expect(TUI_CONFIRM_MARKER).toBe('Enter to confirm');
-  });
 });
 
 // consumeBusySeen is set synchronously from raw PTY bytes — no xterm async needed.
@@ -134,6 +128,124 @@ describe('ScreenModel raw-chunk busy detection', () => {
     screen.write('hello');
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.quietMs()).toBeGreaterThanOrEqual(40);
+  });
+});
+
+describe('preTrustWorkspace', () => {
+  let tmpDir: string;
+  let claudeJsonPath: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pty-trust-test-'));
+    claudeJsonPath = path.join(tmpDir, '.claude.json');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('creates ~/.claude.json with all flags when file absent', () => {
+    preTrustWorkspace('/workspace/test', claudeJsonPath);
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.projects['/workspace/test'].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects['/workspace/test'].projectOnboardingSeenCount).toBe(1);
+    expect(data.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('adds flags to existing file without overwriting other data', () => {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({ userID: 'abc123', projects: { '/other': { foo: 'bar' } } }));
+    preTrustWorkspace('/workspace/new', claudeJsonPath);
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.userID).toBe('abc123');
+    expect(data.projects['/other'].foo).toBe('bar');
+    expect(data.projects['/workspace/new'].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects['/workspace/new'].projectOnboardingSeenCount).toBe(1);
+    expect(data.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('skips write when all flags already set', () => {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({
+      hasCompletedOnboarding: true,
+      projects: { '/ws': { hasTrustDialogAccepted: true, projectOnboardingSeenCount: 1 } },
+    }));
+    const mtime = fs.statSync(claudeJsonPath).mtimeMs;
+    preTrustWorkspace('/ws', claudeJsonPath);
+    expect(fs.statSync(claudeJsonPath).mtimeMs).toBe(mtime);
+  });
+
+  it('writes when project flags set but global flags missing', () => {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({
+      projects: { '/ws': { hasTrustDialogAccepted: true, projectOnboardingSeenCount: 1 } },
+    }));
+    preTrustWorkspace('/ws', claudeJsonPath);
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('writes when hasTrustDialogAccepted set but projectOnboardingSeenCount missing', () => {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({ projects: { '/ws': { hasTrustDialogAccepted: true } } }));
+    preTrustWorkspace('/ws', claudeJsonPath);
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.projects['/ws'].projectOnboardingSeenCount).toBe(1);
+  });
+
+  it('sets trust when project entry exists but flags are missing', () => {
+    fs.writeFileSync(claudeJsonPath, JSON.stringify({ projects: { '/ws': { someOtherKey: 1 } } }));
+    preTrustWorkspace('/ws', claudeJsonPath);
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.projects['/ws'].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects['/ws'].projectOnboardingSeenCount).toBe(1);
+    expect(data.projects['/ws'].someOtherKey).toBe(1);
+  });
+
+  it('handles malformed ~/.claude.json gracefully', () => {
+    fs.writeFileSync(claudeJsonPath, 'not valid json');
+    expect(() => preTrustWorkspace('/ws', claudeJsonPath)).not.toThrow();
+    const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+    expect(data.projects['/ws'].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects['/ws'].projectOnboardingSeenCount).toBe(1);
+    expect(data.hasCompletedOnboarding).toBe(true);
+  });
+});
+
+describe('checkAuthStatus', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns loggedIn=false when binary does not exist', () => {
+    expect(checkAuthStatus('/nonexistent/claude-binary').loggedIn).toBe(false);
+  });
+
+  it('returns loggedIn=false when binary exits non-zero', () => {
+    expect(checkAuthStatus('false').loggedIn).toBe(false);
+  });
+
+  it('returns loggedIn=false when binary outputs invalid JSON', () => {
+    // echo outputs its args ("auth status") which is not valid JSON
+    expect(checkAuthStatus('echo').loggedIn).toBe(false);
+  });
+
+  it('returns loggedIn=true and authMethod when binary outputs valid JSON', () => {
+    const script = path.join(tmpDir, 'fake-claude.sh');
+    fs.writeFileSync(script, '#!/bin/sh\necho \'{"loggedIn":true,"authMethod":"oauth"}\'\n');
+    fs.chmodSync(script, 0o755);
+    const result = checkAuthStatus(script);
+    expect(result.loggedIn).toBe(true);
+    expect(result.authMethod).toBe('oauth');
+  });
+
+  it('returns loggedIn=false when JSON has loggedIn=false', () => {
+    const script = path.join(tmpDir, 'fake-claude-unauth.sh');
+    fs.writeFileSync(script, '#!/bin/sh\necho \'{"loggedIn":false}\'\n');
+    fs.chmodSync(script, 0o755);
+    expect(checkAuthStatus(script).loggedIn).toBe(false);
   });
 });
 

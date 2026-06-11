@@ -1,6 +1,6 @@
 import { Terminal } from '@xterm/headless';
 
-export type DialogKind = 'bypass-permissions' | 'trust-folder' | 'unknown-select';
+export type DialogKind = 'bypass-permissions';
 
 /** The TUI renders spaces as U+00A0 (non-breaking) — normalize before matching. */
 function normalize(text: string): string {
@@ -12,18 +12,13 @@ function normalize(text: string): string {
  * When upgrading Claude Code, re-check each constant against the new TUI output.
  * All matchers live here so a UI change requires touching exactly one file.
  *
- *   BUSY_MARKER        status bar text during an active turn
- *   PROMPT_RE          idle input caret pattern
- *   BYPASS_PERMS       "Bypass Permissions" dialog markers
- *   TRUST_FOLDER       workspace trust dialog marker
- *   NUMBERED_SELECT_RE generic numbered select — combined with CONFIRM_MARKER
+ *   BUSY_MARKER   status bar text during an active turn
+ *   PROMPT_RE     idle input caret pattern
+ *   BYPASS_PERMS  "Bypass Permissions" dialog markers
  */
 export const TUI_BUSY_MARKER = 'esc to interrupt';
 export const TUI_PROMPT_RE = /^❯ /m;
 export const TUI_BYPASS_PERMS = ['Bypass Permissions mode', 'Yes, I accept'] as const;
-export const TUI_TRUST_FOLDER = 'Do you trust the files in this folder';
-export const TUI_NUMBERED_SELECT_RE = /❯ 1\./;
-export const TUI_CONFIRM_MARKER = 'Enter to confirm';
 
 /**
  * Virtual terminal fed with raw PTY bytes. Used ONLY for liveness signals
@@ -82,13 +77,6 @@ export class ScreenModel {
     const text = this.text();
     if (TUI_BYPASS_PERMS.every((s) => text.includes(s))) {
       return 'bypass-permissions';
-    }
-    if (text.includes(TUI_TRUST_FOLDER)) {
-      return 'trust-folder';
-    }
-    // Generic numbered select dialog while no turn output is flowing.
-    if (!text.includes(TUI_BUSY_MARKER) && TUI_NUMBERED_SELECT_RE.test(text) && text.includes(TUI_CONFIRM_MARKER)) {
-      return 'unknown-select';
     }
     return null;
   }
