@@ -373,22 +373,46 @@ async function restoreSockets(registry: AppsRegistry, socketServer: SocketServer
       if (!svc?.gateway_api) continue;
 
       try { fs.unlinkSync(sockPath); } catch { /* stale or absent */ }
-      fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+      // Ensure socket directory is writable by the current process.
+      // If owned by root (from a prior sudo run), remove and recreate it.
+      // rmSync is wrapped: EPERM on rmSync must not skip the remaining sockets.
+      const sockDir = path.dirname(sockPath);
+      try {
+        const dirStat = fs.statSync(sockDir, { throwIfNoEntry: false });
+        if (dirStat) {
+          try { fs.accessSync(sockDir, fs.constants.W_OK); } catch {
+            fs.rmSync(sockDir, { recursive: true, force: true });
+          }
+        }
+        fs.mkdirSync(sockDir, { recursive: true });
+      } catch (err) {
+        console.warn(`[gateway] Failed to prepare socket dir ${sockDir}: ${(err as Error).message} — skipping ${app.name}/${svcName}`);
+        continue;
+      }
 
-      socketServer.start(sockPath, {
-        appName: app.name,
-        serviceName: svcName,
-        appDir: app.installPath,
-        scripts: Object.fromEntries(
-          Object.entries(svc.gateway_api.scripts ?? {}).map(([name, s]: [string, AppYamlScript]) => [
-            name,
-            { path: s.path, timeoutMs: parseTimeoutMs(s.timeout), args: s.args },
-          ]),
-        ),
-      });
+      try {
+        await socketServer.start(sockPath, {
+          appName: app.name,
+          serviceName: svcName,
+          appDir: app.installPath,
+          scripts: Object.fromEntries(
+            Object.entries(svc.gateway_api.scripts ?? {}).map(([name, s]: [string, AppYamlScript]) => [
+              name,
+              { path: s.path, timeoutMs: parseTimeoutMs(s.timeout), args: s.args },
+            ]),
+          ),
+        });
+      } catch (err) {
+        console.warn(`[gateway] Failed to restore socket for ${app.name}/${svcName}: ${(err as Error).message} — skipping`);
+      }
     }
   }
 }
+
+// Module-level flag and shutdown reference so crash handlers can clean up child
+// processes even when the error occurs outside main()'s try/catch scope.
+let isShuttingDown = false;
+let registeredShutdown: ((signal: string) => Promise<void>) | null = null;
 
 async function main(): Promise<void> {
   // Load agent .env files before config interpolation so ${TOKEN} vars resolve
@@ -689,8 +713,10 @@ async function main(): Promise<void> {
 
   configWatcher.start();
 
-  // Graceful shutdown
+  // Graceful shutdown — idempotent: safe to call from multiple signal/error sources.
   const shutdown = async (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     console.log(`[gateway] Received ${signal}, shutting down...`);
 
     for (const scheduler of schedulers) {
@@ -708,14 +734,40 @@ async function main(): Promise<void> {
     }
 
     console.log('[gateway] Shutdown complete.');
-    process.exit(0);
   };
 
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  // Expose shutdown to the module-level crash handlers registered below.
+  registeredShutdown = shutdown;
+
+  process.on('SIGTERM', () => shutdown('SIGTERM').then(() => process.exit(0)));
+  process.on('SIGINT', () => shutdown('SIGINT').then(() => process.exit(0)));
 }
 
+async function emergencyShutdown(label: string, detail: unknown): Promise<void> {
+  console.error(`[gateway] ${label}:`, detail);
+  if (registeredShutdown && !isShuttingDown) {
+    try {
+      await registeredShutdown(label);
+    } catch (e) {
+      console.error('[gateway] Error during emergency shutdown:', e);
+    }
+  }
+}
+
+// Without these handlers, any unhandled rejection or uncaught exception crashes
+// the process immediately via main().catch() — bypassing shutdown() and leaving
+// child receiver processes (bun) alive as zombies that accumulate across restarts.
+process.on('unhandledRejection', (reason) => {
+  // If a clean SIGTERM shutdown is already in progress, don't interrupt it with
+  // a crash exit — let the in-progress shutdown finish and exit 0.
+  if (isShuttingDown) return;
+  emergencyShutdown('unhandledRejection', reason).finally(() => process.exit(1));
+});
+process.on('uncaughtException', (err) => {
+  if (isShuttingDown) return;
+  emergencyShutdown('uncaughtException', err).finally(() => process.exit(1));
+});
+
 main().catch((err) => {
-  console.error('[gateway] Fatal error:', err);
-  process.exit(1);
+  emergencyShutdown('Fatal error in main()', err).finally(() => process.exit(1));
 });

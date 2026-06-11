@@ -58,6 +58,11 @@ class MockAgentRunner extends EventEmitter {
   markSessionActive(sessionId: string): void {
     this._activeApiSessions.add(sessionId);
   }
+
+  // Required by media_files path validation in the router
+  getAgentsBaseDir(): string {
+    return '/tmp';
+  }
 }
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -152,23 +157,49 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
     );
   });
 
-  it('returns 400 when message is missing', async () => {
+  it('returns 400 when message is missing and no media_files provided', async () => {
     const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({});
+      .send({ chat_id: 'test-chat' });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/message is required/i);
   });
 
-  it('returns 400 when message is empty string', async () => {
+  it('returns 400 when message is empty string and no media_files provided', async () => {
     const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({ message: '   ' });
+      .send({ message: '   ', chat_id: 'test-chat' });
     expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/message is required/i);
+  });
+
+  it('returns 200 when message is missing but media_files is provided (image-only)', async () => {
+    let receivedMessage: string | undefined;
+    const app = buildApp(async (_sid, _chatId, msg) => {
+      receivedMessage = msg;
+      return { text: 'Saw the image.', attachments: [] };
+    });
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ chat_id: 'test-chat', media_files: ['ui-upload/abc/test.jpg'] });
+    expect(res.status).toBe(200);
+    expect(res.body.response).toBe('Saw the image.');
+    // Runner receives empty string when no text was provided
+    expect(receivedMessage).toBe('');
+  });
+
+  it('returns 200 when message is empty string but media_files is provided', async () => {
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: '   ', chat_id: 'test-chat', media_files: ['ui-upload/abc/test.jpg'] });
+    expect(res.status).toBe(200);
   });
 
   it('returns 400 when message exceeds 10,000 chars', async () => {
@@ -462,7 +493,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   });
 
   // T4: no message returns 400 JSON
-  it('T4: stream with no message returns 400 JSON', async () => {
+  it('T4: stream with no message and no media_files returns 400 JSON', async () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
       cb.onDone('ok', []);
       return () => {};
@@ -470,9 +501,23 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({ stream: true });
+      .send({ chat_id: 'test-chat', stream: true });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/message is required/i);
+  });
+
+  // T4b: stream + image-only (no message) returns 200 SSE
+  it('T4b: stream with image-only (no message) returns 200', async () => {
+    const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
+      cb.onDone('Saw the image.', []);
+      return () => {};
+    });
+    const { status } = await collectSSE(app, {
+      chat_id: 'test-chat',
+      stream: true,
+      media_files: ['ui-upload/abc/test.jpg'],
+    });
+    expect(status).toBe(200);
   });
 
   // T5: conflict returns 409 JSON
@@ -562,6 +607,55 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     });
 
     expect(cleanupCalled).toBe(true);
+  }, 10000);
+
+  // T8b: onDone fires after SSE client disconnects — no crash, router stays stable
+  it('T8b: onDone fires after SSE client disconnects — no crash', async () => {
+    let onDoneCalled = false;
+    let savedCallbacks: StreamCallbacks | undefined;
+
+    const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
+      savedCallbacks = cb;
+      cb.onChunk({ type: 'text_delta', text: 'partial' });
+      // Disconnect handler: simulate Claude finishing after client leaves
+      return () => {
+        setTimeout(() => {
+          savedCallbacks!.onDone('full response after disconnect', []);
+          onDoneCalled = true;
+        }, 50);
+      };
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const server = app.listen(0, () => {
+        const addr = server.address() as { port: number };
+        const reqBody = JSON.stringify({ message: 'hi', chat_id: 'test-chat', stream: true });
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: addr.port,
+            path: POST_URL,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer sk-test-app',
+              'Content-Length': Buffer.byteLength(reqBody),
+            },
+          },
+          (res) => {
+            res.once('data', () => { res.destroy(); });
+          },
+        );
+        req.on('error', () => {});
+        req.write(reqBody);
+        req.end();
+        setTimeout(() => { server.close(); resolve(); }, 500);
+      });
+      server.on('error', reject);
+    });
+
+    await new Promise(r => setTimeout(r, 200));
+    expect(onDoneCalled).toBe(true);
   }, 10000);
 
   // T-ALLOW-TOOLS-1: key with allow_tools=true passes allowTools=true to runner

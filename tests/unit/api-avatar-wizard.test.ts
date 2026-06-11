@@ -370,7 +370,71 @@ describe('GET /api/v1/agents/:agentId/avatar', () => {
         .set('Authorization', `Bearer ${READ_KEY}`);
       expect(res.status).toBe(200);
       expect(res.headers['content-type']).toMatch(/image\/png/);
-      expect(res.headers['cache-control']).toMatch(/max-age=3600/);
+      expect(res.headers['cache-control']).toBe('no-cache');
+      expect(res.headers['etag']).toMatch(/^W\//);
+      expect(res.headers['last-modified']).toBeDefined();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns 304 when ETag matches (If-None-Match)', async () => {
+    const { app, tmpDir, agentDir } = buildCtx({ avatar: 'avatar.png' });
+    try {
+      const buf = makePngBuffer(200);
+      fs.writeFileSync(path.join(agentDir, 'avatar.png'), buf);
+
+      // First request — get the ETag
+      const first = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`);
+      expect(first.status).toBe(200);
+      const etag = first.headers['etag'];
+      expect(etag).toBeDefined();
+
+      // Second request with matching If-None-Match — must return 304
+      const second = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`)
+        .set('If-None-Match', etag);
+      expect(second.status).toBe(304);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns 200 with new content when ETag does not match (file changed)', async () => {
+    const { app, tmpDir, agentDir } = buildCtx({ avatar: 'avatar.png' });
+    try {
+      fs.writeFileSync(path.join(agentDir, 'avatar.png'), makePngBuffer(200));
+
+      const res = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`)
+        .set('If-None-Match', 'W/"stale-etag"');
+      expect(res.status).toBe(200);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns 304 when ETag appears in comma-separated If-None-Match list', async () => {
+    const { app, tmpDir, agentDir } = buildCtx({ avatar: 'avatar.png' });
+    try {
+      fs.writeFileSync(path.join(agentDir, 'avatar.png'), makePngBuffer(200));
+
+      const first = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`);
+      expect(first.status).toBe(200);
+      const etag = first.headers['etag'];
+
+      // Browser may send multiple ETags — current ETag is one of them
+      const second = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`)
+        .set('If-None-Match', `W/"other-etag", ${etag}`);
+      expect(second.status).toBe(304);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -383,6 +447,64 @@ describe('GET /api/v1/agents/:agentId/avatar', () => {
         .get(`/api/v1/agents/${AGENT_ID}/avatar`)
         .set('Authorization', `Bearer ${READ_KEY}`);
       expect(res.status).toBe(404);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression: stale agentConfigs after extension change (PUT jpeg → PUT png → GET)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('avatar extension change regression', () => {
+  it('GET returns 200 immediately after PUT with different extension (no stale 404)', async () => {
+    const { app, tmpDir, agentDir, agentConfigs } = buildCtx({ avatar: 'avatar.jpeg' });
+    try {
+      // Seed the old jpeg file on disk (as if uploaded previously)
+      fs.writeFileSync(path.join(agentDir, 'avatar.jpeg'), makeJpegBuffer(200));
+
+      // PUT a PNG — this should delete avatar.jpeg, write avatar.png, and update agentConfigs in-memory
+      const putRes = await supertest.default(app)
+        .put(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${WRITE_KEY}`)
+        .set('Content-Type', 'image/png')
+        .send(makePngBuffer(200));
+      expect(putRes.status).toBe(200);
+
+      // In-memory map must reflect the new filename immediately (before any file watcher fires)
+      expect(agentConfigs.get(AGENT_ID)?.avatar).toBe('avatar.png');
+
+      // GET immediately after — must NOT return 404 "Avatar file not found"
+      const getRes = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`);
+      expect(getRes.status).toBe(200);
+      expect(getRes.headers['content-type']).toMatch(/image\/png/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('GET returns 404 after DELETE — agentConfigs.avatar removed immediately', async () => {
+    const { app, tmpDir, agentDir, agentConfigs } = buildCtx({ avatar: 'avatar.png' });
+    try {
+      fs.writeFileSync(path.join(agentDir, 'avatar.png'), makePngBuffer(200));
+
+      const delRes = await supertest.default(app)
+        .delete(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${WRITE_KEY}`);
+      expect(delRes.status).toBe(204);
+
+      // In-memory map must have avatar removed immediately
+      expect(agentConfigs.get(AGENT_ID)?.avatar).toBeUndefined();
+
+      // GET must return 404 (no avatar set), not 500 or stale file reference
+      const getRes = await supertest.default(app)
+        .get(`/api/v1/agents/${AGENT_ID}/avatar`)
+        .set('Authorization', `Bearer ${READ_KEY}`);
+      expect(getRes.status).toBe(404);
+      expect(getRes.body.error).toMatch(/no avatar/i);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

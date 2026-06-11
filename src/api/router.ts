@@ -282,11 +282,11 @@ export function createApiRouter(
     };
     const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message } = body;
 
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      res.status(400).json({ error: 'message is required and must be a non-empty string' });
+    if (message !== undefined && typeof message !== 'string') {
+      res.status(400).json({ error: 'message must be a string if provided' });
       return;
     }
-    if (message.length > MAX_MESSAGE_LENGTH) {
+    if (typeof message === 'string' && message.length > MAX_MESSAGE_LENGTH) {
       res.status(400).json({ error: `message too long (max ${MAX_MESSAGE_LENGTH} characters)` });
       return;
     }
@@ -327,6 +327,15 @@ export function createApiRouter(
       validatedMediaFiles = media_files as string[];
     }
 
+    // Allow message OR media_files. Image-only sends pass an empty text
+    // alongside the image_path attribute on channelXml so Claude can Read the file.
+    const trimmedMessage = typeof message === 'string' ? message.trim() : '';
+    const hasMedia = !!(validatedMediaFiles && validatedMediaFiles.length);
+    if (!trimmedMessage && !hasMedia) {
+      res.status(400).json({ error: 'message is required and must be a non-empty string (or provide media_files)' });
+      return;
+    }
+
     if (store_user_message !== undefined && typeof store_user_message !== 'boolean') {
       res.status(400).json({ error: 'store_user_message must be a boolean if provided' });
       return;
@@ -349,11 +358,12 @@ export function createApiRouter(
         ? timeout_ms
         : DEFAULT_TIMEOUT_MS;
 
-    // Built-in command dispatch — only intercept known commands, let everything else reach Claude
-    if (AgentRunner.isApiBuiltinCommand(message.trim())) {
+    // Built-in command dispatch — only intercept known commands, let everything else reach Claude.
+    // Image-only sends have an empty trimmedMessage and never match built-in commands.
+    if (trimmedMessage && AgentRunner.isApiBuiltinCommand(trimmedMessage)) {
       try {
-        const result = await runner.executeApiCommand(sessionId, chatIdStr, message.trim());
-        res.json({ command: message.trim(), session_id: sessionId, result });
+        const result = await runner.executeApiCommand(sessionId, chatIdStr, trimmedMessage);
+        res.json({ command: trimmedMessage, session_id: sessionId, result });
       } catch (err: unknown) {
         res.status(500).json({ error: (err as Error).message ?? 'Command failed' });
       }
@@ -362,7 +372,7 @@ export function createApiRouter(
 
     if (stream) {
       // SSE streaming mode
-      let cleanup: (() => void) | undefined;
+      let onClientDisconnect: (() => void) | undefined;
       try {
         const sseCallbacks = {
           onChunk: (event: import('../types').StreamEvent) => {
@@ -402,16 +412,16 @@ export function createApiRouter(
 
         const agentCfg = agentConfigs.get(agentId)!;
         const allowTools = agentCfg.allow_tools ?? !!apiKey.allow_tools;
-        cleanup = await runner.sendApiMessageStream(
+        onClientDisconnect = await runner.sendApiMessageStream(
           sessionId,
           chatIdStr,
-          message.trim(),
+          trimmedMessage,
           sseCallbacks,
           { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage },
         );
 
-        // Client disconnect -> cleanup
-        res.on('close', cleanup);
+        // Client disconnect — marks SSE writes as no-op; stream continues server-side until result is saved to DB
+        res.on('close', onClientDisconnect);
       } catch (err: unknown) {
         const code = (err as { code?: string }).code;
         if (!res.headersSent) {
@@ -432,7 +442,7 @@ export function createApiRouter(
       try {
         const agentCfgSync = agentConfigs.get(agentId)!;
         const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
-        const { text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, message.trim(), {
+        const { text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, trimmedMessage, {
           timeoutMs,
           allowTools: allowToolsSync,
           mediaFiles: validatedMediaFiles,
@@ -1890,6 +1900,11 @@ export function createApiRouter(
       return;
     }
 
+    // Update in-memory map immediately — don't wait for the file watcher so the
+    // GET handler can serve the new file before the next config reload fires.
+    const cfg = agentConfigs.get(agentId);
+    if (cfg) cfg.avatar = newFilename;
+
     res.json({ avatarUrl: `/api/v1/agents/${agentId}/avatar` });
   });
 
@@ -1923,6 +1938,10 @@ export function createApiRouter(
       return;
     }
 
+    // Update in-memory map immediately — same reason as PUT handler above.
+    const cfg = agentConfigs.get(agentId);
+    if (cfg) delete cfg.avatar;
+
     res.status(204).send();
   });
 
@@ -1948,15 +1967,36 @@ export function createApiRouter(
       res.status(400).json({ error: 'Invalid avatar path' });
       return;
     }
-    if (!fs.existsSync(avatarPath)) { res.status(404).json({ error: 'Avatar file not found' }); return; }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(avatarPath);
+    } catch {
+      res.status(404).json({ error: 'Avatar file not found' });
+      return;
+    }
 
     const ext = path.extname(avatarPath).slice(1).toLowerCase();
     const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
     const contentType = mimeMap[ext] ?? 'application/octet-stream';
 
-    res.setHeader('Cache-Control', 'private, max-age=3600');
+    // Weak ETag — mtime+size cannot guarantee byte-identical content so strong ETag is inappropriate.
+    const etag = `W/"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+
+    // no-cache forces revalidation on every request; ETag allows 304 when file is unchanged.
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', new Date(stat.mtimeMs).toUTCString());
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    // If-None-Match may be a comma-separated list of ETags; check each token.
+    const ifNoneMatch = req.headers['if-none-match'];
+    const matched = ifNoneMatch && ifNoneMatch.split(',').map(t => t.trim()).includes(etag);
+    if (matched) {
+      res.status(304).end();
+      return;
+    }
     res.sendFile(avatarPath);
   });
 
@@ -1992,10 +2032,19 @@ export function createApiRouter(
   router.get('/v1/agents/:agentId/sessions', auth, async (req: Request, res: Response) => {
     const ctx = resolveApiSession(req, res);
     if (!ctx) return;
-    const { runner, agentId, chatId } = ctx;
+    const { runner, chatId } = ctx;
     try {
       const index = await runner.listApiSessions(chatId);
-      res.json(index);
+      const historySessions = runner.getHistoryDb().listSessions(`api-${chatId}`);
+      const roleMap = new Map(historySessions.map((s) => [s.sessionId, s.lastMessageRole]));
+      const enriched = {
+        ...index,
+        sessions: index.sessions.map((s) => {
+          const lastMessageRole = roleMap.get(s.id) ?? undefined;
+          return lastMessageRole !== undefined ? { ...s, lastMessageRole } : s;
+        }),
+      };
+      res.json(enriched);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -2211,7 +2260,7 @@ export function createApiRouter(
       console.error(`[api] Failed to delete GREETING.md for '${agentId}': ${(e as Error).message}`);
     }
 
-    let cleanup: (() => void) | undefined;
+    let onClientDisconnect: (() => void) | undefined;
     try {
       const sseCallbacks = {
         onChunk: (event: import('../types').StreamEvent) => {
@@ -2242,7 +2291,7 @@ export function createApiRouter(
       res.flushHeaders();
       res.socket?.setNoDelay(true);
 
-      cleanup = await runner.sendApiMessageStream(
+      onClientDisconnect = await runner.sendApiMessageStream(
         sessionId,
         chatId,
         content,
@@ -2250,7 +2299,7 @@ export function createApiRouter(
         { timeoutMs: DEFAULT_TIMEOUT_MS, skipUserMessage: true },
       );
 
-      res.on('close', cleanup);
+      res.on('close', onClientDisconnect);
     } catch (err: unknown) {
       const code = (err as { code?: string }).code;
       // res.headersSent is always true here (writeHead is called before sendApiMessageStream),
