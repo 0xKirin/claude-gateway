@@ -5,6 +5,7 @@ import {
   loadWorkspace,
   migrateWorkspaceFiles,
   watchWorkspace,
+  AGENT_WRITABLE_FILES,
   MissingRequiredFileError,
 } from '../../src/agent/workspace-loader';
 
@@ -272,6 +273,47 @@ describe('workspace-loader', () => {
         expect(fs.existsSync(path.join(tmpDir, 'soul.md'))).toBe(false);
         // SOUL.md should now exist
         expect(fs.existsSync(path.join(tmpDir, 'SOUL.md'))).toBe(true);
+      } finally {
+        handle.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Self-restart footgun guard: agent-writable files skip busy-session restart
+  // -------------------------------------------------------------------------
+  it('AGENT_WRITABLE_FILES: contains all 4 memory-rule files, not HEARTBEAT/IDENTITY/CLAUDE', () => {
+    // Files the memory rule authorizes the agent to write
+    expect(AGENT_WRITABLE_FILES.has('MEMORY.md')).toBe(true);
+    expect(AGENT_WRITABLE_FILES.has('USER.md')).toBe(true);
+    expect(AGENT_WRITABLE_FILES.has('SOUL.md')).toBe(true);
+    expect(AGENT_WRITABLE_FILES.has('AGENTS.md')).toBe(true);
+    // Files NOT self-written → still trigger a normal restart-or-defer
+    expect(AGENT_WRITABLE_FILES.has('HEARTBEAT.md')).toBe(false);
+    expect(AGENT_WRITABLE_FILES.has('IDENTITY.md')).toBe(false);
+    expect(AGENT_WRITABLE_FILES.has('CLAUDE.md')).toBe(false);
+  });
+
+  it('watchWorkspace: onChange receives canonical changed filename (MEMORY.md)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wl-watch-'));
+    try {
+      fs.writeFileSync(path.join(tmpDir, 'AGENTS.md'), '# Agent');
+      fs.writeFileSync(path.join(tmpDir, 'MEMORY.md'), 'initial');
+
+      const batches: string[][] = [];
+      const handle = watchWorkspace(tmpDir, (changed) => { batches.push(changed); });
+
+      try {
+        await new Promise((r) => setTimeout(r, 500));
+        fs.writeFileSync(path.join(tmpDir, 'MEMORY.md'), 'updated by agent');
+        await new Promise((r) => setTimeout(r, 1500));
+
+        const all = batches.flat();
+        expect(all).toContain('MEMORY.md');
+        // self-written-only change → every changed file is agent-writable
+        expect(all.every((f) => AGENT_WRITABLE_FILES.has(f))).toBe(true);
       } finally {
         handle.close();
       }

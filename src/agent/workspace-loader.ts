@@ -170,13 +170,42 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
 const WATCH_DEBOUNCE_MS = 300;
 
 /**
+ * Canonical workspace files the agent is authorized to write itself, per the
+ * memory rule (see MEMORY_RULE above). When ONLY these change, a busy session
+ * must not be force-restarted: the change most likely came from that very
+ * session mid-turn, and a deferred restart would stop it the moment the turn
+ * completes (the self-restart footgun). Idle sessions are still restarted so
+ * the change reaches them on their next spawn, and the recomposed CLAUDE.md
+ * carries the change into every future spawn regardless.
+ */
+export const AGENT_WRITABLE_FILES = new Set<string>([
+  'MEMORY.md',
+  'USER.md',
+  'SOUL.md',
+  'AGENTS.md',
+]);
+
+/**
+ * Normalize a changed file path to its canonical uppercase basename, resolving
+ * legacy lowercase aliases (e.g. memory.md → MEMORY.md).
+ */
+function canonicalWorkspaceName(filePath: string): string {
+  const base = path.basename(filePath);
+  return LOWERCASE_TO_UPPERCASE[base] ?? base;
+}
+
+/**
  * Watch a workspace directory for changes.
- * Calls onChange when any .md file changes (debounced 300ms).
+ * Calls onChange (debounced 300ms) with the de-duplicated list of canonical
+ * filenames that changed (e.g. ['MEMORY.md', 'SOUL.md']).
  * If a file matching a known lowercase alias is added, it is auto-renamed to
  * its uppercase canonical name before triggering onChange.
  * Returns a WatchHandle with a close() method.
  */
-export function watchWorkspace(workspaceDir: string, onChange: () => void): WatchHandle {
+export function watchWorkspace(
+  workspaceDir: string,
+  onChange: (changedFiles: string[]) => void,
+): WatchHandle {
   return createWatcher({
     paths: [path.join(workspaceDir, '*.md')],
     debounceMs: WATCH_DEBOUNCE_MS,
@@ -194,7 +223,10 @@ export function watchWorkspace(workspaceDir: string, onChange: () => void): Watc
         }
       }
     },
-    onChange,
+    onChange: (changedPaths: string[]) => {
+      const names = Array.from(new Set(changedPaths.map(canonicalWorkspaceName)));
+      onChange(names);
+    },
   });
 }
 
