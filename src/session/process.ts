@@ -8,6 +8,7 @@ import { AgentConfig, GatewayConfig } from '../types';
 import { SessionStore } from './store';
 import { createLogger } from '../logger';
 import { ptyStreamRegistry } from '../shell/pty-stream-registry';
+import { neutralizeTuiTriggers } from '../shell/screen';
 import {
   CODING_TOOLS,
   TOOL_LABELS,
@@ -15,7 +16,7 @@ import {
   truncateDetail,
 } from '../utils/tool-labels';
 
-const MAX_HISTORY_MESSAGES = 50;
+export const MAX_HISTORY_MESSAGES = 50;
 const AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_RESTARTS = 3;
 // Bound how many times a single session may auto-respawn to recover from a
@@ -34,6 +35,12 @@ export class SessionProcess extends EventEmitter {
   /** Backend used to run the subprocess. Set during start(); 'headless' until then. */
   backend: 'pty-shell' | 'headless' = 'headless';
   modelOverride?: string; // per-session model override (set by runner from SessionMeta)
+  // Per-spawn cap on how many history messages buildInitialPrompt re-injects.
+  // Defaults to MAX_HISTORY_MESSAGES; the runner lowers it (set before start())
+  // when recovering from a repeated request_too_large (32MB) so each retry
+  // re-loads less context until it drops under Anthropic's request ceiling.
+  // 0 = inject no history at all (fully fresh context).
+  historyLimit: number = MAX_HISTORY_MESSAGES;
   spawnContext: { loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number } | null = null;
   private process: ChildProcess | null = null;
   private stopping = false;
@@ -177,15 +184,21 @@ export class SessionProcess extends EventEmitter {
     // so the model retains context from before the truncation window.
     const SUMMARY_MARKER = '[Conversation Summary]';
     const firstMsg = history[0];
+    // Clamp to a sane range; the runner uses this to escalate-shrink history on
+    // repeated request_too_large (50→40→30→20→10→0). limit === 0 → no history.
+    const limit = Math.max(0, this.historyLimit);
     const hasSummary =
-      history.length > MAX_HISTORY_MESSAGES &&
+      limit > 1 &&
+      history.length > limit &&
       firstMsg?.role === 'system' &&
       typeof firstMsg.content === 'string' &&
       firstMsg.content.trimStart().startsWith(SUMMARY_MARKER);
 
-    const recent = hasSummary
-      ? [firstMsg, ...history.slice(-(MAX_HISTORY_MESSAGES - 1))]
-      : history.slice(-MAX_HISTORY_MESSAGES);
+    const recent = limit <= 0
+      ? []
+      : hasSummary
+        ? [firstMsg, ...history.slice(-(limit - 1))]
+        : history.slice(-limit);
 
     const loadedAtSpawn = recent.length;
     const archivedCount = history.length - recent.length;
@@ -210,7 +223,13 @@ export class SessionProcess extends EventEmitter {
       .join('\n');
 
     return {
-      historyPrompt: `[Conversation history with this user:\n${historyText}]`,
+      // Defense-in-depth: defang any verbatim 32MB-overlay text captured into past
+      // messages before it is re-typed into the TUI. The primary fix routes the real
+      // error off the screen-scraper to the transcript's `<synthetic>` record (see
+      // TranscriptTailer.onRequestTooLarge), so detectRequestTooLarge() is no longer
+      // wired into the trigger — but neutralizing the re-injected copy keeps the
+      // poisoned overlay text off the screen entirely and out of any future scraper.
+      historyPrompt: `[Conversation history with this user:\n${neutralizeTuiTriggers(historyText)}]`,
       loadedAtSpawn,
       archivedCount,
       messageCountAtSpawn,
