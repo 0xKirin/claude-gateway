@@ -255,10 +255,11 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    // The first stdin.write call contains the initial prompt
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // Nothing written to stdin yet — history is deferred to first sendMessage call
+    expect(lastProcess!.stdin!.write.mock.calls.length).toBe(0);
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     expect(text).toContain('Conversation history');
     expect(text).toContain('User: Hello');
@@ -296,9 +297,9 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     // Should contain Message 59 (last) but NOT Message 0 (first — truncated)
     expect(text).toContain('Message 59');
@@ -328,9 +329,9 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     // Summary and last message must be present
     expect(text).toContain('[Conversation Summary]');
@@ -354,9 +355,9 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     expect(text).toContain('Msg 59');
     expect(text).not.toContain('Msg 0');
@@ -383,9 +384,9 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     expect(text).toContain('[Conversation Summary]');
     expect(text).toContain('Short 1');
@@ -419,9 +420,9 @@ describe('SessionProcess', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     // Last 50 messages = indices 11–60, so 'First normal message' (idx 0) is out
     expect(text).not.toContain('First normal message');
@@ -445,9 +446,9 @@ describe('SessionProcess', () => {
     sp.historyLimit = 10; // escalated rung (e.g. after several 32MB recoveries)
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     // Only the last 10 messages (50–59) survive; 49 and older are dropped.
     expect(text).toContain('Rung 59');
@@ -480,6 +481,61 @@ describe('SessionProcess', () => {
     expect(text).not.toContain('Fresh 0');
     expect(text).not.toContain('Fresh 4');
     expect(text).not.toContain('Conversation history with this user');
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-RESTART-01: subprocess crash + restart with prior history must produce
+  //   exactly ONE stdin write when the next user message arrives (no double-response).
+  //   Before the fix, activation was sent at spawn (Turn 1) and the channel XML
+  //   arrived separately (Turn 2), causing two Claude responses forwarded to the
+  //   channel. After the fix, both are bundled into a single stdin write.
+  // --------------------------------------------------------------------------
+  it('U-SP-RESTART-01: session restart with history produces one bundled stdin write, not two separate turns', async () => {
+    await sessionStore.appendTelegramMessage('alfred', 'chat:rst', 'chat:rst', {
+      role: 'user', content: 'Prior question', ts: 1000,
+    });
+    await sessionStore.appendTelegramMessage('alfred', 'chat:rst', 'chat:rst', {
+      role: 'assistant', content: 'Prior answer', ts: 1001,
+    });
+
+    const sp = new SessionProcess('chat:rst', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+    const firstProcess = lastProcess!;
+    spawnMock.mockClear();
+
+    // Verify: nothing written to stdin yet (activation deferred, no double-response risk)
+    expect(firstProcess.stdin!.write.mock.calls.length).toBe(0);
+
+    jest.useFakeTimers();
+    try {
+      // Simulate subprocess crash
+      firstProcess.emit('exit', 1, null);
+      jest.advanceTimersByTime(1); // drain nextTick from kill()
+      jest.advanceTimersByTime(6000); // fire AUTO_RESTART_DELAY_MS (5s) timer
+      for (let i = 0; i < 5; i++) await Promise.resolve(); // drain spawnProcess promises
+    } finally {
+      jest.useRealTimers();
+    }
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const restarted = lastProcess!;
+    expect(restarted).not.toBe(firstProcess);
+
+    // Verify: still nothing written to the restarted process (history still deferred)
+    expect(restarted.stdin!.write.mock.calls.length).toBe(0);
+
+    // Simulates the user's next message arriving (e.g. "Y" to a pending plan menu)
+    sp.sendMessage('<channel source="telegram" chat_id="chat:rst">Y</channel>');
+
+    // Exactly ONE write — history + activation + user message bundled together
+    expect(restarted.stdin!.write.mock.calls.length).toBe(1);
+    const bundled: string = JSON.parse(restarted.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
+    expect(bundled).toContain('Prior question');
+    expect(bundled).toContain('Prior answer');
+    expect(bundled).toContain('Channels mode is active');
+    expect(bundled).toContain('Y');
+
+    await sp.stop();
   });
 
   // --------------------------------------------------------------------------
@@ -1473,9 +1529,9 @@ describe('SessionProcess — buildInitialPrompt system role', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     expect(text).toContain('System: [Image Context Summary]');
     expect(text).not.toContain('Assistant: [Image Context Summary]');
@@ -1495,9 +1551,9 @@ describe('SessionProcess — buildInitialPrompt system role', () => {
     const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    const firstWrite = lastProcess!.stdin!.write.mock.calls[0][0] as string;
-    const parsed = JSON.parse(firstWrite);
-    const text: string = parsed.message.content[0].text;
+    // sendMessage bundles history + activation + user message into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
 
     expect(text).toContain('User: show me a picture');
     expect(text).toContain('Assistant: Here is the image.');
@@ -1804,10 +1860,11 @@ describe('SessionProcess — corrupted thinking-block recovery', () => {
     const respawned = lastProcess!;
     expect(respawned).not.toBe(firstProcess);
 
-    // The respawned subprocess gets a fresh prompt rebuilt from text history —
-    // clean, with no corrupted thinking content.
-    const initialWrite = respawned.stdin!.write.mock.calls[0][0] as string;
-    const text: string = JSON.parse(initialWrite).message.content[0].text;
+    // Nothing written to the new process yet — history deferred to first sendMessage
+    expect(respawned.stdin!.write.mock.calls.length).toBe(0);
+    // sendMessage bundles clean text-only history + activation into one stdin write
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(respawned.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
     expect(text).toContain('Conversation history');
     expect(text).toContain('clean reply');
     expect(text).not.toContain('cannot be modified');
