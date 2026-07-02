@@ -14,12 +14,13 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as readline from 'readline';
 import { translateArgs, sanitizeUserText } from './args';
-import { ScreenModel, MenuOption, parseMenuChoice, formatMenuPrompt, formatPermissionPrompt, extractChannelContent, isPtyActivelyWorking } from './screen';
+import { ScreenModel, MenuOption, parseMenuChoice, formatMenuPrompt, formatPermissionPrompt, extractChannelContent, isPtyActivelyWorking, parseInteractivePrompt } from './screen';
 import { PtyHost } from './pty-host';
-import { TranscriptTailer, AssistantRecord, UsageInfo, hasInteractiveMenuToolUse } from './tailer';
+import { TranscriptTailer, AssistantRecord, UsageInfo } from './tailer';
 import { ProtocolEmitter } from './emitter';
 import { preTrustWorkspace, checkAuthStatus } from './trust';
 import { decideMenuCancel } from './menu-cancel';
+import { decideProbeAttempt, confirmProbeReaction, ProbeState, PROBE_KEY_DOWN, PROBE_KEY_UP, PROBE_SETTLE_MS } from './menu-probe';
 
 const POLL_MS = 200;
 const STARTUP_QUIET_MS = 600;
@@ -87,9 +88,30 @@ interface ActiveTurn {
   dialogEscapes: number;
   /** Snapshot of tailer.seenRecords at turn start — used to detect per-turn output. */
   recordsAtStart: number;
-  /** Set once this turn invoked a menu-raising tool (AskUserQuestion/ExitPlanMode).
-   *  Gates menu bridging so only a transcript-backed menu is bridged to chat. */
-  menuToolSeen: boolean;
+  /** True when this turn was begun by a menu selection (handleMenuReply) — the
+   *  only turn type where a live menu can legitimately still be on screen
+   *  before any busy/record signal this turn (the digit was swallowed with the
+   *  menu still up, or a multi-question wizard advanced to its next step
+   *  without the tool_use returning). Gates probe eligibility and the
+   *  Enter-retry's menu suppression (review round 2, findings 1+4). */
+  fromMenuSelection: boolean;
+  /** Behavioral-probe round budget for this turn's current stall, or null
+   *  before the first probe round. Replaces the old transcript-gated
+   *  menuToolSeen — see maybeProbeAndBridge()/advanceProbe() below and
+   *  planning-61. */
+  probe: ProbeState | null;
+}
+
+/** An in-flight behavioral probe round, advanced by tick() (see Driver.probe). */
+interface ProbeRound {
+  /** The turn that owns this round — abandoned when the turn ends. */
+  turn: ActiveTurn;
+  /** 'sent-down' after the Down keystroke; 'sent-up' after the Up fallback. */
+  phase: 'sent-down' | 'sent-up';
+  /** When the current phase's keystroke was written (settle timing). */
+  sentAt: number;
+  /** Full screen snapshot taken immediately before the Down keystroke. */
+  before: string;
 }
 
 class Driver {
@@ -120,6 +142,15 @@ class Driver {
   // re-sent every poll while the error overlay lingers. Reset when a new turn begins.
   private requestTooLargeHandled = false;
   private lastDialogActionAt = 0;
+  // In-flight behavioral probe round, advanced synchronously by tick() at a
+  // single chokepoint — the same tick-driven pattern as menuCancel and
+  // interrupting (review round 2, finding 6; replaced a detached async
+  // coroutine whose racing with tick() needed scattered mutual-exclusion
+  // guards). While set, tick() returns early, so no other keystroke path
+  // (dialog auto-accept, Enter-retry, fallback-idle) can interleave with the
+  // round's arrows, and every non-confirmed exit funnels through
+  // finishProbeRound() so an Up-recall is always restored.
+  private probe: ProbeRound | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private host!: PtyHost;
   private tailer!: TranscriptTailer;
@@ -285,9 +316,6 @@ class Driver {
       this.turn.lastProgressAt = Date.now();
       if (text) this.turn.texts.push(text);
       if (usage) this.turn.usage = usage;
-      // Authoritative menu signal: this turn called a menu-raising tool, so a
-      // menu on screen now is real (not a quoted/rendered look-alike).
-      if (hasInteractiveMenuToolUse(record.message)) this.turn.menuToolSeen = true;
     } else {
       logDebug('assistant record outside an active turn (emitted anyway)');
     }
@@ -367,7 +395,7 @@ class Driver {
   }
 
   /** Initialize a fresh active turn (shared by normal submit and menu selection). */
-  private beginTurn(): void {
+  private beginTurn(fromMenuSelection = false): void {
     const now = Date.now();
     this.idleNotified = false;
     this.requestTooLargeHandled = false;
@@ -382,7 +410,8 @@ class Driver {
       usage: null,
       dialogEscapes: 0,
       recordsAtStart: this.tailer.seenRecords,
-      menuToolSeen: false,
+      fromMenuSelection,
+      probe: null,
     };
   }
 
@@ -393,6 +422,11 @@ class Driver {
       this.queue.length = 0;
       return;
     }
+    // Clear any stale text sitting in the input line first — e.g. history the
+    // probe's Up fallback recalled that an abandoned round couldn't restore —
+    // so it is never prepended to this message (review round 2, finding 3).
+    // A no-op at an empty idle prompt.
+    this.host.writeRaw('\x15');
     if (NO_BRACKETED_PASTE) {
       // Fallback: sanitizeUserText() strips all CR, so '\r' below is the only
       // submit trigger — safe for multiline text without bracketed paste.
@@ -491,6 +525,17 @@ class Driver {
       this.emitter.emitSessionIdle(this.args.sessionId);
     }
 
+    // In-flight behavioral probe round: advance it at this single chokepoint
+    // and do nothing else this tick — the dialog auto-accept '2', menu-cancel
+    // ESCs, and the Enter-retry / fallback-idle keystrokes below must never
+    // interleave with the round's arrows. advanceProbe() itself abandons the
+    // round (restoring any Up-recall) when the owning turn is gone or an
+    // interrupt is settling, so the blocks below run one tick later at most.
+    if (this.probe) {
+      this.advanceProbe(now);
+      return;
+    }
+
     // Waiting for the TUI to settle after ESC-cancelling a bridged menu (the user
     // typed a free-text reply instead of a number). Submit the queued prompt only
     // once the menu is gone and the prompt is idle — otherwise the paste races
@@ -550,6 +595,11 @@ class Driver {
     if (this.screen.consumeBusySeen() || this.screen.isBusy()) {
       turn.sawBusy = true;
       turn.lastProgressAt = now;
+      // Real activity resumed — a probe that ran out of rounds during this
+      // stall gets a fresh budget if the turn genuinely stalls again later.
+      // (A round can't be in flight here: tick() already returned at the
+      // probe chokepoint above while one is outstanding.)
+      if (turn.probe) turn.probe.rounds = 0;
       return;
     }
 
@@ -557,35 +607,36 @@ class Driver {
     // (turn_duration normally ends the turn before we get here).
     this.maybeHandleDialog();
 
-    // Blocked on an interactive select menu → bridge it to chat and end the turn
-    // so the session goes idle (no watchdog kill) until the user picks an option.
-    if (this.maybeBridgeMenu(turn)) return;
-
-    // Blocked on a tool-permission prompt (e.g. the dangerous-rm circuit breaker
-    // that fires even under --dangerously-skip-permissions). Bridge the Yes/No to
-    // chat for a human to decide — never auto-accept — and end the turn so the
-    // session goes idle instead of wedging until the watchdog.
-    if (this.maybeBridgePermissionPrompt(turn)) return;
+    // Blocked on a live interactive overlay (AskUserQuestion menu, plan
+    // approval, or a tool-permission Yes/No prompt) → probe behaviorally and
+    // bridge it to chat if confirmed, so the session goes idle (no watchdog
+    // kill) until the user picks an option. Starts a round at most; the
+    // chokepoint above advances it on subsequent ticks and bridges on
+    // confirmation.
+    this.maybeProbeAndBridge(turn, now);
+    if (this.probe) return; // a round just started — let it settle
 
     if (!turn.sawBusy
         && now - turn.submittedAt > SUBMIT_RETRY_AFTER_MS
         && this.screen.hasPrompt()
-        && !this.screen.interactivePromptBlocking()
+        && !(turn.fromMenuSelection && this.screen.interactivePromptBlocking())
         && this.screen.quietMs() > 1500
         && this.tailer.seenRecords === turn.recordsAtStart) {
       // Only retry if no new records have appeared since this turn started —
       // a delta > 0 means claude already started writing output.
       //
-      // interactivePromptBlocking() excludes the case where the TUI is still on
-      // a live menu/wizard screen (e.g. a multi-question AskUserQuestion that
-      // advances internally between sub-questions without the tool_use ever
-      // returning — so no new tailer record appears). hasPrompt()'s idle-prompt
-      // regex (`/^❯ /m`) can't tell that caret apart from a highlighted menu
-      // option row using the same `❯` marker, so without this guard a live
-      // wizard step reads as "Enter got swallowed": the code blindly re-sends
-      // Enter into the menu (selecting whatever option happens to be
-      // highlighted) and eventually reports a false 'failed to submit' even
-      // though the wizard was progressing normally the whole time.
+      // The interactivePromptBlocking() suppression applies ONLY to a
+      // menu-selection turn: there a live menu genuinely can still be on
+      // screen with no busy/record signal (the digit was swallowed, or a
+      // multi-question wizard advanced), and a blind Enter would select
+      // whatever row is highlighted — the probe re-bridges that state
+      // instead. For an ordinary turn in this branch a menu is impossible
+      // (Claude produced no output yet — same reasoning as the probe gate in
+      // maybeProbeAndBridge()), so the retry must NOT be gated on screen
+      // text: the unsubmitted draft itself renders as "❯ <text>" and, when
+      // its text starts with "N.", satisfies the caret scan — suppressing
+      // the exact retry this state needs and wedging the turn into the
+      // 30-min watchdog (review round 2, finding 1).
       if (turn.enterRetries < MAX_ENTER_RETRIES) {
         turn.enterRetries++;
         turn.submittedAt = now;
@@ -630,82 +681,141 @@ class Driver {
     }
   }
 
-  // ---- interactive menu bridging ------------------------------------------
+  // ---- interactive-prompt behavioral probe --------------------------------
 
   /**
-   * If the TUI is blocked on an interactive select menu, emit it to the gateway
-   * (rendered as chat buttons / numbered text) and end the turn so the session
-   * goes idle while we await the user's choice. Returns true if it bridged.
+   * Behavioral gate replacing the old screen-regex detectors + transcript
+   * menuToolSeen gate (planning-61). While the turn looks stalled (settled
+   * quiet, not busy, not already mid-selection), spend one probe round: send
+   * an arrow keystroke and check whether the screen actually reacts. Rounds
+   * are budgeted (PROBE_MAX_ROUNDS) and cooldown-spaced (decideProbeAttempt())
+   * so a genuinely non-menu stall falls through to the existing Enter-retry /
+   * fallback-idle-detection / watchdog path exactly as it does today.
    *
-   * Never auto-selects — a destructive option must be a human decision. The
-   * bypass-permissions dialog also shows the menu footer, so it's excluded here
-   * and left to maybeHandleDialog()'s auto-accept.
+   * Starts the round only — tick()'s chokepoint drives it forward via
+   * advanceProbe(), which ends the turn itself (via bridgeChoiceToChat())
+   * only if the round confirms a live overlay.
    */
-  private maybeBridgeMenu(turn: ActiveTurn): boolean {
-    if (SKIP_MENU_BRIDGE || this.pendingMenu) return false;
-    // Authoritative gate: only bridge when this turn actually invoked a menu tool
-    // (AskUserQuestion/ExitPlanMode). Without it, a reply or re-injected history
-    // that renders a numbered list + the menu footer would spawn a phantom menu.
-    // The transcript tool_use can't be forged by on-screen text. Fails safe: if a
-    // genuine non-tool menu ever exists it simply isn't bridged (no false buttons).
-    if (!turn.menuToolSeen) return false;
-    if (this.screen.quietMs() < MENU_STABLE_QUIET_MS) return false;
-    if (this.screen.detectDialog() === 'bypass-permissions') return false;
-    const options = this.screen.detectMenu();
-    if (!options) return false;
-
-    const prompt = formatMenuPrompt(options);
-    logWarn(`interactive menu detected (${options.length} options) — bridging to chat`);
-    this.bridgeChoiceToChat(turn, options, prompt);
-    return true;
+  private maybeProbeAndBridge(turn: ActiveTurn, now: number): void {
+    if (SKIP_MENU_BRIDGE || this.pendingMenu) return;
+    // An interactive overlay can only exist once Claude produced output this
+    // turn — AskUserQuestion and the permission prompt both require a running
+    // turn, so the busy spinner or a transcript record precedes them — or
+    // when this turn IS a menu selection (see ActiveTurn.fromMenuSelection).
+    // Before that, a quiet stall is a submission problem (swallowed Enter),
+    // and probing it would type arrows into the user's unsubmitted draft —
+    // the Up could replace the draft with recalled history that the later
+    // Enter-retry then submits (review round 2, finding 4).
+    if (!turn.sawBusy && !turn.fromMenuSelection
+        && this.tailer.seenRecords === turn.recordsAtStart) return;
+    if (this.screen.quietMs() < MENU_STABLE_QUIET_MS) return;
+    const probe = (turn.probe ??= { lastAttemptAt: 0, rounds: 0 });
+    if (decideProbeAttempt(probe, { now }) !== 'send') return;
+    if (this.screen.detectDialog() === 'bypass-permissions') return;
+    probe.lastAttemptAt = now;
+    probe.rounds++;
+    this.probe = { turn, phase: 'sent-down', sentAt: now, before: this.screen.text() };
+    this.host.writeRaw(PROBE_KEY_DOWN);
   }
 
   /**
-   * Shared tail of maybeBridgeMenu / maybeBridgePermissionPrompt: emit the
-   * channel-native choice UI, carry the same text as the turn's result (API/no-
-   * button fallback + chat history), record the pending menu so the reply routes
-   * back to a selection, and end the turn so the session goes idle while awaiting
-   * the human's choice.
+   * Advance the in-flight probe round by one tick (called only from tick()'s
+   * chokepoint while `this.probe` is set). One round: send Down, settle,
+   * check for a screen change; if Down produced nothing, retry once with Up
+   * (covers the "already at the last option, no wraparound" boundary case).
+   * A change alone is NOT enough to bridge: the before/after snapshots must
+   * both parse as the same-shaped prompt whose ❯-highlighted row MOVED
+   * (confirmProbeReaction() — the plan's point-2 comparison). Anything else
+   * — unparseable, menu-shaped text whose caret didn't move, work resuming
+   * mid-round, the turn ending, an interrupt settling — funnels through
+   * finishProbeRound(), which restores any Up-recall (fail-safe: no bridge
+   * rather than a fabricated one, and never stale text left in the input).
+   *
+   * The settle wait is tick-quantized: with POLL_MS === PROBE_SETTLE_MS the
+   * effective settle is one to two poll intervals, which is fine — the outer
+   * MENU_STABLE_QUIET_MS gate already guarantees the screen was stable when
+   * the round started.
+   */
+  private advanceProbe(now: number): void {
+    const p = this.probe as ProbeRound;
+    // Owner turn gone (turn_duration landed mid-round) or a /stop interrupt
+    // is settling — abandon before typing anything further.
+    if (this.turn !== p.turn || this.interrupting) {
+      this.finishProbeRound(p, 'turn ended or interrupt in flight');
+      return;
+    }
+    if (now - p.sentAt < PROBE_SETTLE_MS) return; // still settling
+    if (this.screen.isBusy()) {
+      // Real work resumed mid-round (a reply started streaming) — the screen
+      // is changing for its own reasons, not reacting to our keystroke.
+      this.finishProbeRound(p, 'work resumed');
+      return;
+    }
+    const after = this.screen.text();
+    if (after === p.before) {
+      if (p.phase === 'sent-down') {
+        // Down produced nothing — maybe the highlight is already on the last
+        // option (no wraparound). Fall back to Up once.
+        p.phase = 'sent-up';
+        p.sentAt = now;
+        this.host.writeRaw(PROBE_KEY_UP);
+        return;
+      }
+      // Neither key produced any change — nothing interactive is listening,
+      // and nothing was recalled, so there is nothing to restore.
+      this.probe = null;
+      return;
+    }
+    const beforeParsed = parseInteractivePrompt(p.before);
+    const afterParsed = parseInteractivePrompt(after);
+    if (!beforeParsed || !afterParsed || !confirmProbeReaction(beforeParsed, afterParsed)) {
+      // Not a live overlay reacting to us — either nothing parses, or
+      // menu-shaped text is on screen but its highlight didn't move (static
+      // prose can't move; only a live menu can).
+      this.finishProbeRound(p, 'screen changed without a live highlight move');
+      return;
+    }
+    const turn = p.turn;
+    this.probe = null;
+    const text = afterParsed.isPermission
+      ? formatPermissionPrompt(afterParsed.context, afterParsed.options)
+      : formatMenuPrompt(afterParsed.options);
+    logWarn(`interactive ${afterParsed.isPermission ? 'permission prompt' : 'menu'} confirmed (${afterParsed.options.length} options, highlight ${beforeParsed.highlighted}→${afterParsed.highlighted}) — bridging to chat`);
+    this.bridgeChoiceToChat(turn, afterParsed.options, text);
+  }
+
+  /**
+   * Single non-confirmed exit for a probe round. When the Up fallback was
+   * sent, it may have recalled input-line history into a genuinely idle
+   * (non-menu) input box — clear it with Ctrl+U so no stale recalled text is
+   * ever prepended to the next submission. Ctrl+U (not a compensating Down)
+   * because recalled entries are routinely multi-line (channel envelopes),
+   * where a Down may only move the cursor within the text instead of
+   * stepping history forward (review round 2, findings 3+5); it is the same
+   * clear the interrupt path relies on (abortIfInterrupted()) and a no-op at
+   * an empty prompt. Never reached after a confirmed bridge — a live menu
+   * consumed the arrows as navigation and its selection is typed as a digit,
+   * position-independent of the caret (selectMenuOption()).
+   */
+  private finishProbeRound(p: ProbeRound, reason: string): void {
+    if (p.phase === 'sent-up') this.host.writeRaw('\x15');
+    this.probe = null;
+    logDebug(`probe round ended without bridging: ${reason}`);
+  }
+
+  /**
+   * Shared tail of a confirmed probe: emit the channel-native choice UI, carry
+   * the same text as the turn's result (API/no-button fallback + chat
+   * history), record the pending menu so the reply routes back to a
+   * selection, and end the turn so the session goes idle while awaiting the
+   * human's choice. Never auto-selects — a destructive/guarded option must
+   * always be a human decision.
    */
   private bridgeChoiceToChat(turn: ActiveTurn, options: MenuOption[], text: string): void {
     this.emitter.emitMenuPrompt({ sessionId: this.args.sessionId, prompt: text, options });
     turn.texts.push((turn.texts.length ? '\n\n' : '') + text);
     this.pendingMenu = { options };
     this.finishTurn(false);
-  }
-
-  /**
-   * If the TUI is blocked on a tool-permission prompt, bridge it to chat as a
-   * Yes/No choice (reusing the menu machinery: emit → buttons → handleMenuReply)
-   * and end the turn so the session goes idle while awaiting the human's decision.
-   * Returns true if it bridged.
-   *
-   * This is the fix for the wedge: Claude Code keeps a few catastrophe guards
-   * (dangerous rm, root/home deletes) that prompt EVEN under
-   * --dangerously-skip-permissions, which the wrapper otherwise assumes never
-   * happens. Such a prompt is neither the startup bypass dialog nor an
-   * AskUserQuestion menu, so without this it is never surfaced and the PTY hangs
-   * at the Yes/No until the 30-min watchdog kills the session.
-   *
-   * NEVER auto-selects — a guarded/destructive operation must be a human decision.
-   * Unlike maybeBridgeMenu there is no transcript tool_use to gate on (the circuit
-   * breaker is CLI-internal UI, not written to the transcript), so detection rests
-   * on detectPermissionPrompt()'s region + multi-marker guard plus the settle
-   * gate. That is the same defense detectDialog() relies on, and bridging to a
-   * human is strictly safer than detectDialog()'s auto-keypress.
-   */
-  private maybeBridgePermissionPrompt(turn: ActiveTurn): boolean {
-    if (SKIP_MENU_BRIDGE || this.pendingMenu) return false;
-    if (this.screen.quietMs() < MENU_STABLE_QUIET_MS) return false;
-    // The bypass-permissions startup dialog is auto-accepted by maybeHandleDialog().
-    if (this.screen.detectDialog() === 'bypass-permissions') return false;
-    const prompt = this.screen.detectPermissionPrompt();
-    if (!prompt) return false;
-
-    const text = formatPermissionPrompt(prompt.context, prompt.options);
-    logWarn(`permission prompt detected (${prompt.options.length} options) — bridging to chat (never auto-accepted)`);
-    this.bridgeChoiceToChat(turn, prompt.options, text);
-    return true;
   }
 
   /** Route a user's menu reply (typed number or button tap) to a selection. */
@@ -748,7 +858,7 @@ class Driver {
     }
     logDebug(`menu selection: ${n}`);
     this.pendingMenu = null;
-    this.beginTurn();
+    this.beginTurn(true);
     void this.selectMenuOption(n);
   }
 
@@ -769,11 +879,12 @@ class Driver {
     // If interrupted while waiting, erase the digit so it doesn't linger in the PTY
     // input and get prepended to the user's next message.
     if (this.abortIfInterrupted()) return;
-    // Send Enter only if a selectable prompt is still blocking at the bottom of the
-    // screen — covers both the AskUserQuestion menu and the permission prompt, and
-    // self-corrects when the digit alone already confirmed (prompt gone → no stray
-    // Enter). Bottom-region scoped so stale footer/option text left in scrollback by
-    // the just-answered prompt can't submit an empty line at the idle caret.
+    // Send Enter only if a selectable prompt still visibly blocks the screen —
+    // covers both the AskUserQuestion menu and the permission prompt, and
+    // self-corrects when the digit alone already confirmed (prompt gone → no
+    // stray Enter). interactivePromptBlocking() is deliberately permissive
+    // (full viewport): a false positive here costs one stray Enter at an idle
+    // empty caret, a no-op.
     if (this.screen.interactivePromptBlocking()) this.host.writeRaw('\r');
     if (this.turn) this.turn.submittedAt = Date.now();
   }
