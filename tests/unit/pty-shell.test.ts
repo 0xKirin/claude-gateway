@@ -1,5 +1,5 @@
 import { translateArgs, sanitizeUserText } from '../../src/shell/args';
-import { projectSlug, transcriptPath, isSyntheticRequestTooLarge, hasInteractiveMenuToolUse } from '../../src/shell/tailer';
+import { projectSlug, transcriptPath, isSyntheticRequestTooLarge } from '../../src/shell/tailer';
 import {
   ScreenModel,
   TUI_BUSY_MARKER,
@@ -17,6 +17,7 @@ import { ProtocolEmitter } from '../../src/shell/emitter';
 import { Writable } from 'stream';
 import { preTrustWorkspace, checkAuthStatus } from '../../src/shell/trust';
 import { decideMenuCancel, MenuCancelState } from '../../src/shell/menu-cancel';
+import { decideProbeAttempt, confirmProbeReaction, ProbeState, PROBE_MAX_ROUNDS, PROBE_RETRY_COOLDOWN_MS } from '../../src/shell/menu-probe';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -116,56 +117,6 @@ describe('ScreenModel TUI constants (Claude Code v2.1.x)', () => {
 
 });
 
-describe('ScreenModel detectRequestTooLarge', () => {
-  it('detects the recoverable 32MB error overlay', async () => {
-    const screen = await renderScreen([
-      '  Read 1 file',
-      '',
-      '  Request too large (max 32MB). Double press esc to go back',
-      '',
-    ]);
-    expect(screen.detectRequestTooLarge()).toBe(true);
-  });
-
-  it('is false on a normal idle screen', async () => {
-    const screen = await renderScreen([
-      '❯ ',
-      'ready for input',
-    ]);
-    expect(screen.detectRequestTooLarge()).toBe(false);
-  });
-
-  it('does not false-positive on prose merely discussing the error', async () => {
-    // The matcher keys on the exact "(max" suffix the TUI renders, so an agent
-    // explaining the concept ("a request that is too large") never trips it.
-    const screen = await renderScreen([
-      'If a request is too large the API rejects it.',
-    ]);
-    expect(screen.detectRequestTooLarge()).toBe(false);
-  });
-
-  it('does not trip when the agent quotes the exact error text without the dismiss footer', async () => {
-    // Self-trigger guard: the agent's own reply may contain the verbatim error
-    // string (e.g. explaining this very bug). Detection requires the dismiss
-    // footer too, which only the real overlay renders — so quoted prose is inert.
-    const screen = await renderScreen([
-      'When the TUI shows "Request too large (max 32MB)" the session must restart.',
-      '❯ ',
-    ]);
-    expect(screen.detectRequestTooLarge()).toBe(false);
-  });
-
-  it('DOES trip on a verbatim overlay copy carrying the footer (the false-positive bug)', async () => {
-    // Reproduces the restart loop: the gateway once captured the whole overlay
-    // sentence — prefix AND footer — into a stored assistant message. Re-typed
-    // into the TUI on the next spawn, it renders both fragments → detection fires
-    // on a healthy session. The "require the footer" guard does NOT save us here.
-    const poison = 'Assistant: ...(กัน double-delete):Request too large (max 32MB). Double press esc to go back and try with a smaller file.';
-    const screen = await renderScreen([poison, '❯ ']);
-    expect(screen.detectRequestTooLarge()).toBe(true);
-  });
-});
-
 describe('neutralizeTuiTriggers (history detox)', () => {
   const POISON =
     'Assistant: ...(กัน double-delete):Request too large (max 32MB). Double press esc to go back and try with a smaller file.';
@@ -181,13 +132,6 @@ describe('neutralizeTuiTriggers (history detox)', () => {
     expect(out).toContain('Request too large ( max 32MB)');
     expect(out).toContain('esc to go  back');
     expect(out).toContain('กัน double-delete'); // surrounding content untouched
-  });
-
-  it('neutralized history no longer trips detection after a TUI round-trip', async () => {
-    // The actual fix: the same poisoned message, detoxed, rendered on screen WITH
-    // the idle caret present, must be inert — closing the restart loop at the source.
-    const screen = await renderScreen([neutralizeTuiTriggers(POISON), '❯ ']);
-    expect(screen.detectRequestTooLarge()).toBe(false);
   });
 
   it('is a no-op on text without the trigger fragments', () => {
@@ -275,8 +219,8 @@ const MENU_FOOTER = 'Enter to select · ↑/↓ to navigate · Esc to cancel';
 // can assert region-restricted behavior against realistic scrollback.
 const FILLER = (n: number) => Array.from({ length: n }, (_, i) => `conversation line ${i}`);
 
-describe('ScreenModel detectMenu', () => {
-  it('parses numbered options (with ❯ highlight + a divider) when the footer is present', async () => {
+describe('ScreenModel readInteractivePrompt (plain AskUserQuestion-style menu)', () => {
+  it('parses numbered options (with ❯ highlight + a divider), classified as a plain menu', async () => {
     const screen = await renderScreen([
       'Which option do you want?',
       '',
@@ -288,17 +232,21 @@ describe('ScreenModel detectMenu', () => {
       '',
       MENU_FOOTER,
     ]);
-    const menu = screen.detectMenu();
-    expect(menu).not.toBeNull();
-    expect(menu!.map((o) => o.index)).toEqual([1, 2, 3, 4]);
-    expect(menu![0].label).toBe('First choice');
-    expect(menu![3].label).toBe('Chat about this');
+    const prompt = screen.readInteractivePrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.isPermission).toBe(false);
+    expect(prompt!.options.map((o) => o.index)).toEqual([1, 2, 3, 4]);
+    expect(prompt!.options[0].label).toBe('First choice');
+    expect(prompt!.options[3].label).toBe('Chat about this');
+    expect(prompt!.highlighted).toBe(1);
   });
 
   it('ignores stale numbered scrollback above the live menu', async () => {
     // Reproduces the live bug: a prior chat message rendered as "1. … 2. …"
-    // sat in scrollback above an AskUserQuestion menu, so detectMenu swept the
-    // phantom rows in — inflating the option list and shifting every index.
+    // sat in scrollback above an AskUserQuestion menu, so a naive scan would
+    // sweep the phantom rows in — inflating the option list and shifting
+    // every index. readInteractivePrompt() takes only the live 1..N run
+    // nearest the end of the buffer.
     const screen = await renderScreen([
       '1. restart gateway now',
       '2. restart drops the running session',
@@ -311,44 +259,125 @@ describe('ScreenModel detectMenu', () => {
       '',
       MENU_FOOTER,
     ]);
-    const menu = screen.detectMenu();
-    expect(menu).not.toBeNull();
-    // Only the real 1..3 run nearest the footer — phantom rows excluded.
-    expect(menu!.map((o) => o.index)).toEqual([1, 2, 3]);
-    expect(menu![0].label).toBe('See the buttons');
-    expect(menu!.map((o) => o.label)).not.toContain('restart gateway now');
+    const prompt = screen.readInteractivePrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.index)).toEqual([1, 2, 3]);
+    expect(prompt!.options[0].label).toBe('See the buttons');
+    expect(prompt!.options.map((o) => o.label)).not.toContain('restart gateway now');
   });
 
-  it('returns null without the menu footer', async () => {
+  it('returns null for plain prose with no live numbered-option run (no caret, no live UI)', async () => {
     const screen = await renderScreen([
       'Here is a numbered list in normal output:',
       '1. not a menu',
       '2. still not a menu',
     ]);
-    expect(screen.detectMenu()).toBeNull();
+    expect(screen.readInteractivePrompt()).toBeNull();
   });
 
-  it('returns null with the footer but fewer than two options', async () => {
+  it('returns null for a markdown blockquote numbered list — ASCII ">" is not a selection caret', async () => {
+    // The fake-menu bug from the PR #181 review (F1): quoted prose like
+    // "> 1. …" satisfied the old [❯>] caret alternation, so an Up-recall
+    // screen change plus this static text bridged a fabricated menu. The
+    // caret gate is now U+276F only — the real TUI never renders ">".
+    const screen = await renderScreen([
+      'The user asked earlier:',
+      '> 1. First choice',
+      '> 2. Second choice',
+      '',
+      '❯ ',
+    ]);
+    expect(screen.readInteractivePrompt()).toBeNull();
+  });
+
+  it('reports which option the caret highlights (probe compares this across snapshots)', async () => {
+    const screen = await renderScreen([
+      'Which option do you want?',
+      '',
+      '  1. First choice',
+      '❯ 2. Second choice',
+      '  3. Third choice',
+      '',
+      MENU_FOOTER,
+    ]);
+    expect(screen.readInteractivePrompt()!.highlighted).toBe(2);
+  });
+
+  it('returns null with fewer than two options', async () => {
     const screen = await renderScreen([
       'Confirm?',
       '  1. Only choice',
       MENU_FOOTER,
     ]);
-    expect(screen.detectMenu()).toBeNull();
+    expect(screen.readInteractivePrompt()).toBeNull();
+  });
+
+  it('reads the highlight from the run\'s own rows — a caret-bearing input line cannot supply it (round-2 finding 2)', async () => {
+    // The recall-forgery hole: a static quoted menu sits in scrollback and the
+    // probe's Up fallback recalls a history entry beginning "2." — the input
+    // line renders as "❯ 2. …", a perfectly caret-shaped option row. A
+    // whole-screen caret scan read the highlight from that bottom-most row
+    // (1→2 = "moved") and bridged a fabricated menu. The highlight must come
+    // from the selected 1..N run itself, where the caret is still on row 1.
+    const screen = await renderScreen([
+      'Earlier the assistant quoted a menu verbatim:',
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '',
+      '❯ 2. remove the old files',
+    ]);
+    const prompt = screen.readInteractivePrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.index)).toEqual([1, 2]);
+    expect(prompt!.highlighted).toBe(1); // NOT 2 from the input line
+  });
+
+  it('the recall-forgery screen pair never satisfies confirmProbeReaction (highlight did not move)', async () => {
+    // End-to-end shape of the round-2 finding-2 exploit: before = quoted menu
+    // + idle input, after = same menu + recalled "2. …" in the input line.
+    // Both parse, both highlight row 1 → no move → no bridge.
+    const before = await renderScreen([
+      'Earlier the assistant quoted a menu verbatim:',
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '',
+      '❯ ',
+    ]);
+    const after = await renderScreen([
+      'Earlier the assistant quoted a menu verbatim:',
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '',
+      '❯ 2. remove the old files',
+    ]);
+    expect(confirmProbeReaction(before.readInteractivePrompt(), after.readInteractivePrompt())).toBe(false);
+  });
+
+  it('returns null when the run carries two highlights (a caret line joined the run)', async () => {
+    // A recalled entry beginning "3." EXTENDS a static [1,2] run into [1,2,3]
+    // and brings a second caret with it — a live menu highlights exactly one
+    // of its rows, so anything else is not a live menu.
+    const screen = await renderScreen([
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '❯ 3. do the third thing',
+    ]);
+    expect(screen.readInteractivePrompt()).toBeNull();
   });
 });
 
 describe('hasPrompt() vs interactivePromptBlocking() (menu-caret false-positive)', () => {
-  // Root cause of the "failed to submit turn to the TUI input" false report during a
-  // multi-question AskUserQuestion wizard: hasPrompt()'s idle-prompt regex (`/^❯ /m`)
-  // scans the whole visible screen and cannot tell the real idle bash caret apart from
-  // a highlighted menu option row, which uses the exact same `❯` marker flush at
-  // column 0. tick()'s "Enter appears swallowed" retry-and-give-up gate must exclude
-  // interactivePromptBlocking() so a live wizard step (no new tailer record yet,
-  // because the tool_use hasn't returned) is never mistaken for a genuinely stuck
-  // idle prompt.
+  // hasPrompt()'s idle-prompt regex (`/^❯ /m`) scans the whole visible screen
+  // and cannot tell the real idle caret apart from a highlighted menu option
+  // row, which uses the exact same `❯` marker flush at column 0.
+  // interactivePromptBlocking() is the DELIBERATELY PERMISSIVE companion scan
+  // (see its doc): it gates only actions where a false positive is cheap —
+  // the confirming Enter after a typed selection, decideMenuCancel's
+  // menuVisible, and the Enter-swallowed retry of a MENU-SELECTION turn. An
+  // ordinary turn's retry is NOT gated on it (the unsubmitted draft itself
+  // renders "❯ <text>" and would suppress the retry — round-2 finding 1).
 
-  it('a highlighted menu option row satisfies hasPrompt() (documents the collision), and interactivePromptBlocking() is also true on the same screen (so the retry gate is excluded)', async () => {
+  it('a highlighted menu option row satisfies hasPrompt() (documents the collision), and interactivePromptBlocking() is also true on the same screen', async () => {
     const screen = await renderScreen([
       ...FILLER(44),
       'Which option do you want?',
@@ -369,6 +398,34 @@ describe('hasPrompt() vs interactivePromptBlocking() (menu-caret false-positive)
       '❯ ',
     ]);
     expect(screen.hasPrompt()).toBe(true);
+    expect(screen.interactivePromptBlocking()).toBe(false);
+  });
+
+  it('sees a menu sitting HIGH on a sparse screen (full-viewport scan — F4)', async () => {
+    // A fresh session renders the menu near the top of the viewport. The old
+    // bottom-20-rows window missed it, so selectMenuOption() skipped the
+    // confirming Enter and the selection hung.
+    const screen = await renderScreen([
+      'Which option do you want?',
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '',
+      MENU_FOOTER,
+    ]);
+    expect(screen.interactivePromptBlocking()).toBe(true);
+  });
+
+  it('markdown blockquote prose ("> 1.") anywhere on screen is not a blocking prompt', async () => {
+    // The full-viewport scan is only safe because ASCII ">" no longer counts
+    // as a caret — otherwise every quoted numbered list would suppress the
+    // Enter-swallowed retry and inject stray Enters after menu selections.
+    const screen = await renderScreen([
+      'The user asked:',
+      '> 1. First choice',
+      '> 2. Second choice',
+      ...FILLER(40),
+      '❯ ',
+    ]);
     expect(screen.interactivePromptBlocking()).toBe(false);
   });
 });
@@ -586,9 +643,10 @@ describe('ScreenModel detectDialog (region-restricted)', () => {
   });
 });
 
-describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-accepts)', () => {
-  // Claude Code's tool-permission footer — note "Tab to amend"/"to explain", which
-  // the select-menu footer ("↑/↓ to navigate") and the 32MB overlay never carry.
+describe('ScreenModel readInteractivePrompt (permission-style Yes/No prompt)', () => {
+  // Claude Code's tool-permission footer — kept in fixtures to mirror real TUI
+  // output, but readInteractivePrompt() no longer requires it (see planning-61:
+  // liveness is now proven behaviorally by the probe, not by footer text).
   const PERM_FOOTER = 'Esc to cancel · Tab to amend · ctrl+e to explain';
 
   it('detects the dangerous-rm circuit-breaker prompt (boxed) and parses Yes/No', async () => {
@@ -603,9 +661,11 @@ describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-acce
       '╰──────────────────────────────────────────────────────────────╯',
       PERM_FOOTER,
     ]);
-    const prompt = screen.detectPermissionPrompt();
+    const prompt = screen.readInteractivePrompt();
     expect(prompt).not.toBeNull();
+    expect(prompt!.isPermission).toBe(true);
     expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
+    expect(prompt!.highlighted).toBe(1);
     // Context echoes the guarded command (box borders stripped), not the filler.
     expect(prompt!.context).toContain('Dangerous rm operation');
     expect(prompt!.context).not.toContain('conversation line');
@@ -619,7 +679,22 @@ describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-acce
       '    2. No',
       PERM_FOOTER,
     ]);
-    const prompt = screen.detectPermissionPrompt();
+    const prompt = screen.readInteractivePrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
+  });
+
+  it('detects the prompt even with no footer line at all (no longer footer-gated)', async () => {
+    // The old detector required a permission-specific footer token before
+    // trusting the screen; the new reader doesn't need it because liveness
+    // was already proven behaviorally before this is ever called.
+    const screen = await renderScreen([
+      ...FILLER(44),
+      'Do you want to proceed?',
+      '❯ 1. Yes',
+      '  2. No',
+    ]);
+    const prompt = screen.readInteractivePrompt();
     expect(prompt).not.toBeNull();
     expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
   });
@@ -632,37 +707,13 @@ describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-acce
       ...FILLER(44),
       '❯ ',
     ]);
-    expect(screen.detectPermissionPrompt()).toBeNull();
+    expect(screen.readInteractivePrompt()).toBeNull();
   });
 
-  it('requires a permission footer token (a plain numbered question never trips it)', async () => {
-    const screen = await renderScreen([
-      ...FILLER(43),
-      'Do you want to proceed?',
-      '❯ 1. Yes',
-      '  2. No',
-    ]);
-    // No "to amend"/"to explain" footer present → not a permission prompt.
-    expect(screen.detectPermissionPrompt()).toBeNull();
-  });
-
-  it('excludes the bypass-permissions startup dialog (handled by detectDialog)', async () => {
-    const screen = await renderScreen([
-      ...FILLER(40),
-      'Bypass Permissions mode',
-      'Do you want to proceed?',
-      '❯ 1. Yes, I accept',
-      '  2. No, exit',
-      PERM_FOOTER,
-    ]);
-    expect(screen.detectPermissionPrompt()).toBeNull();
-    expect(screen.detectDialog()).toBe('bypass-permissions');
-  });
-
-  it('requires a ❯/> selection caret — a numbered list in prose never trips it', async () => {
-    // Worst case for the footer gate: conversational text that happens to pair the
-    // question with a numbered list AND the verbatim footer phrase. With no live
-    // select caret on an option row it is still not a real prompt → no bridge.
+  it('requires a ❯ selection caret — a numbered list in prose never trips it', async () => {
+    // Conversational text that happens to pair the question with a numbered
+    // list. With no live select caret on an option row it is still not a
+    // real prompt → no bridge.
     const screen = await renderScreen([
       ...FILLER(40),
       'Do you want to proceed? Here is the plan I would run:',
@@ -670,7 +721,18 @@ describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-acce
       '2. Then remove the old files',
       PERM_FOOTER,
     ]);
-    expect(screen.detectPermissionPrompt()).toBeNull();
+    expect(screen.readInteractivePrompt()).toBeNull();
+  });
+
+  it('a markdown blockquote "> 1." beside the question is not a caret either', async () => {
+    const screen = await renderScreen([
+      ...FILLER(40),
+      'Do you want to proceed? The choices were quoted as:',
+      '> 1. Yes',
+      '> 2. No',
+      PERM_FOOTER,
+    ]);
+    expect(screen.readInteractivePrompt()).toBeNull();
   });
 
   it('binds context to the question NEAREST the options when an earlier one is quoted', async () => {
@@ -688,7 +750,7 @@ describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-acce
       '╰──────────────────────────────────────────────────────────────╯',
       PERM_FOOTER,
     ]);
-    const prompt = screen.detectPermissionPrompt();
+    const prompt = screen.readInteractivePrompt();
     expect(prompt).not.toBeNull();
     expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
     expect(prompt!.context).toContain('Dangerous rm operation');
@@ -717,42 +779,72 @@ describe('formatPermissionPrompt', () => {
   });
 });
 
-describe('hasInteractiveMenuToolUse (authoritative menu gate)', () => {
-  it('true when the record invokes AskUserQuestion', () => {
-    expect(hasInteractiveMenuToolUse({
-      role: 'assistant',
-      content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 't1', input: { questions: [] } }],
-    })).toBe(true);
+describe('menu-probe decideProbeAttempt (behavioral probe round budget)', () => {
+  // Mirrors decideMenuCancel's test style: pure per-round bookkeeping, kept
+  // free of node-pty/screen imports so it's cheap to test in isolation.
+  const T0 = 100_000;
+  const baseState = (): ProbeState => ({ lastAttemptAt: T0, rounds: 1 });
+
+  it('sends a new round once the cooldown has elapsed', () => {
+    const action = decideProbeAttempt(baseState(), { now: T0 + PROBE_RETRY_COOLDOWN_MS });
+    expect(action).toBe('send');
   });
 
-  it('true for the plan-approval ExitPlanMode tool', () => {
-    expect(hasInteractiveMenuToolUse({
-      role: 'assistant',
-      content: [{ type: 'tool_use', name: 'ExitPlanMode', id: 't2', input: {} }],
-    })).toBe(true);
+  it('waits while still within the cooldown window since the last attempt', () => {
+    const action = decideProbeAttempt(baseState(), { now: T0 + PROBE_RETRY_COOLDOWN_MS - 1 });
+    expect(action).toBe('wait');
   });
 
-  it('also accepts the legacy snake_case exit_plan_mode name', () => {
-    // Claude Code's binary carries both PascalCase and snake_case; the emitted
-    // tool name varies by model, so both must gate the bridge.
-    expect(hasInteractiveMenuToolUse({
-      role: 'assistant',
-      content: [{ type: 'tool_use', name: 'exit_plan_mode', id: 't2b', input: {} }],
-    })).toBe(true);
+  it('sends the very first round immediately (lastAttemptAt=0 is far in the past)', () => {
+    const action = decideProbeAttempt({ lastAttemptAt: 0, rounds: 0 }, { now: T0 });
+    expect(action).toBe('send');
   });
 
-  it('false for a normal text reply (even if it mentions the tool name)', () => {
-    expect(hasInteractiveMenuToolUse({
-      role: 'assistant',
-      content: [{ type: 'text', text: 'I will use AskUserQuestion to ask you.' }],
-    })).toBe(false);
+  it('gives up once PROBE_MAX_ROUNDS have been spent, regardless of cooldown', () => {
+    const action = decideProbeAttempt(
+      { lastAttemptAt: T0, rounds: PROBE_MAX_ROUNDS },
+      { now: T0 + PROBE_RETRY_COOLDOWN_MS + 10_000 },
+    );
+    expect(action).toBe('give-up');
   });
 
-  it('false for an unrelated tool', () => {
-    expect(hasInteractiveMenuToolUse({
-      role: 'assistant',
-      content: [{ type: 'tool_use', name: 'Bash', id: 't3', input: { command: 'ls' } }],
-    })).toBe(false);
+  it('give-up takes priority over cooldown (both conditions true)', () => {
+    const action = decideProbeAttempt(
+      { lastAttemptAt: T0, rounds: PROBE_MAX_ROUNDS },
+      { now: T0 }, // also within cooldown
+    );
+    expect(action).toBe('give-up');
+  });
+});
+
+describe('menu-probe confirmProbeReaction (highlight-move confirmation)', () => {
+  // The plan's point-2 "before/after comparison of the highlighted row"
+  // (post-review hardening F1): a probe keystroke only counts as a menu
+  // reaction when the SAME-shaped prompt parses in both snapshots and the
+  // ❯-highlighted index moved. A raw screen-text diff bridged fabricated
+  // menus when Up-recall changed the screen around static menu-shaped text.
+  const readout = (highlighted: number, count = 3) => ({
+    options: Array.from({ length: count }, (_, i) => ({ index: i + 1, label: `opt ${i + 1}` })),
+    highlighted,
+  });
+
+  it('confirms when the highlight moved (Down: 1→2, and the Up fallback: 3→2)', () => {
+    expect(confirmProbeReaction(readout(1), readout(2))).toBe(true);
+    expect(confirmProbeReaction(readout(3), readout(2))).toBe(true);
+  });
+
+  it('rejects when the highlight did not move — static menu-shaped text cannot react', () => {
+    expect(confirmProbeReaction(readout(1), readout(1))).toBe(false);
+  });
+
+  it('rejects when either snapshot has no parseable prompt', () => {
+    expect(confirmProbeReaction(null, readout(2))).toBe(false);
+    expect(confirmProbeReaction(readout(1), null)).toBe(false);
+    expect(confirmProbeReaction(null, null)).toBe(false);
+  });
+
+  it('rejects when the option count changed (different prompt, not a reaction)', () => {
+    expect(confirmProbeReaction(readout(1, 3), readout(2, 4))).toBe(false);
   });
 });
 
