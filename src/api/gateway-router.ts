@@ -227,20 +227,28 @@ export class GatewayRouter {
       const now = Date.now();
       const dashExpiry = xDashToken ? (this.dashboardTokens.get(xDashToken) ?? 0) : 0;
       const dashValid = dashExpiry > now;
-      if (dashValid) {
-        // Dashboard tokens are one-time-use: revoke immediately after auth so a
-        // leaked page source can't be replayed (each /dashboard visit gets a fresh one).
-        this.dashboardTokens.delete(xDashToken);
-      }
       if (!dashValid && (!token || !apiKeys.some((k) => k.key === token))) {
         res.status(401).json({ error: 'Unauthorized' });
         return;
+      }
+      // Dashboard tokens are one-time-use so a leaked page source can't be replayed.
+      // But a single page load must open several viewers and reconnect, so consume
+      // the presented token and hand back a fresh one (rotation). The client stores
+      // it for its next request. Returned on error responses too, so a failed open
+      // (e.g. the session just ended) never strands the client with a spent token.
+      // API-key callers neither send nor receive this (dashToken stays undefined and
+      // JSON.stringify omits it).
+      let dashToken: string | undefined;
+      if (dashValid) {
+        this.dashboardTokens.delete(xDashToken);
+        dashToken = crypto.randomBytes(16).toString('hex');
+        this.dashboardTokens.set(dashToken, now + 10 * 60 * 1000);
       }
       const body = (req.body as { agentId?: string; sessionId?: string }) ?? {};
       const agentId = body.agentId ?? '';
       const sessionId = body.sessionId ?? '';
       if (!agentId || !this.agents.has(agentId)) {
-        res.status(404).json({ error: 'Agent not found' });
+        res.status(404).json({ error: 'Agent not found', dashToken });
         return;
       }
       // Bind the ticket to a specific session. Validate the session actually
@@ -249,13 +257,13 @@ export class GatewayRouter {
       const sessionExists = (this.agents.get(agentId)?.getSessionsSummary() ?? [])
         .some((s) => s.sessionId === sessionId);
       if (!sessionId || !sessionExists) {
-        res.status(404).json({ error: 'Session not found' });
+        res.status(404).json({ error: 'Session not found', dashToken });
         return;
       }
       const ticket = crypto.randomBytes(16).toString('hex');
       const expiresAt = Date.now() + 30_000;
       this.ptyStreamTickets.set(ticket, { agentId, sessionId, expiresAt });
-      res.json({ ticket, expiresAt: new Date(expiresAt).toISOString() });
+      res.json({ ticket, expiresAt: new Date(expiresAt).toISOString(), dashToken });
     });
 
     // Mount API router after body parser so req.body is populated

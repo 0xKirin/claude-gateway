@@ -271,7 +271,10 @@ export function generateDashboardHtml(dashToken = ''): string {
   <script>
     // Read short-lived dashboard token from meta tag (10 min, server-issued at page load).
     // The raw API key is never embedded in HTML — only this scoped, expiring token is.
-    const DASHBOARD_API_KEY = document.querySelector('meta[name="dash-token"]') ? document.querySelector('meta[name="dash-token"]').getAttribute('content') : '';
+    // Each pty-stream-ticket request consumes this one-time token and returns a fresh
+    // one (rotation), so it must be mutable: opening a second viewer or reconnecting
+    // reuses the rotated token instead of the already-spent original (which 401s).
+    let DASHBOARD_API_KEY = document.querySelector('meta[name="dash-token"]') ? document.querySelector('meta[name="dash-token"]').getAttribute('content') : '';
 
     // Must match the server PTY size (src/shell/screen.ts ScreenModel defaults).
     const PTY_COLS = 200;
@@ -323,8 +326,13 @@ export function generateDashboardHtml(dashToken = ''): string {
         headers: { 'Content-Type': 'application/json', 'X-Dash-Token': DASHBOARD_API_KEY },
         body: JSON.stringify({ agentId, sessionId }),
       });
-      const { ticket } = await r.json();
-      return proto + '//' + window.location.host + base + '?ticket=' + ticket;
+      const data = await r.json();
+      // Store the rotated one-time token so the next viewer/reconnect can auth.
+      // The server returns it on success AND on 4xx (e.g. session ended) so a
+      // failed open never leaves the dashboard holding a spent token.
+      if (data && data.dashToken) DASHBOARD_API_KEY = data.dashToken;
+      if (!r.ok || !data.ticket) throw new Error('ticket request failed: ' + r.status);
+      return proto + '//' + window.location.host + base + '?ticket=' + data.ticket;
     }
 
     // ── PTY Viewer ───────────────────────────────────────────────────────────
