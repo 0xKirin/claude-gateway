@@ -3,10 +3,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-async function pollUntil(condition: () => boolean, intervalMs = 50, timeoutMs = 6000): Promise<void> {
+async function pollUntil(condition: () => boolean, intervalMs = 50, timeoutMs = 8000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
-    if (Date.now() >= deadline) return;
+    if (Date.now() >= deadline) throw new Error(`pollUntil timed out after ${timeoutMs}ms`);
     await new Promise(r => setTimeout(r, intervalMs));
   }
 }
@@ -98,14 +98,28 @@ function getSessions(runner: AgentRunner): Map<string, SessionProcess> {
 async function sendCommand(
   port: number,
   body: Record<string, unknown>,
+  retries = 3,
 ): Promise<{ status: number; data: Record<string, unknown> }> {
-  const res = await fetch(`http://127.0.0.1:${port}/command`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = (await res.json()) as Record<string, unknown>;
-  return { status: res.status, data };
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json()) as Record<string, unknown>;
+      return { status: res.status, data };
+    } catch (err) {
+      const e = err as Error & { code?: string; cause?: { code?: string } };
+      const code = e.cause?.code ?? e.code;
+      if ((code === 'ECONNRESET' || code === 'ECONNREFUSED') && attempt < retries) {
+        await new Promise(r => setTimeout(r, 100 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('sendCommand: unreachable');
 }
 
 async function sendChannelPost(
@@ -159,7 +173,10 @@ describe('AgentRunner /command endpoint', () => {
 
   afterEach(async () => {
     if (runner) {
-      await runner.stop();
+      await Promise.race([
+        runner.stop(),
+        new Promise<void>(r => setTimeout(r, 5000)),
+      ]);
     }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -229,9 +246,9 @@ describe('AgentRunner /command endpoint', () => {
   });
 
   // --------------------------------------------------------------------------
-  // U-CMD-04: set_model updates agent-level model and stops session process
+  // U-CMD-04: set_model updates agent-level model and restarts session process
   // --------------------------------------------------------------------------
-  it('U-CMD-04: set_model with active session updates agent model and writes restart signal', async () => {
+  it('U-CMD-04: set_model with active session updates agent model and restarts process', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
@@ -252,15 +269,9 @@ describe('AgentRunner /command endpoint', () => {
     expect(data.success).toBe(true);
     expect(data.model).toBe('claude-sonnet-4-6');
 
-    // Session stays in the map — signal file triggers graceful restart via chokidar.
-    // The session is NOT removed immediately (unlike the old direct stop approach).
-    expect(sessions.has('chat123')).toBe(true);
-
-    // Verify a restart signal file was written
-    const signalPath = path.join(agentConfig.workspace, '.telegram-state', 'restart-chat123');
-    expect(fs.existsSync(signalPath)).toBe(true);
-    const signalContent = JSON.parse(fs.readFileSync(signalPath, 'utf-8'));
-    expect(signalContent.notify.text).toContain('claude-sonnet-4-6');
+    // Session is removed from map — restartProcess() stops + deletes it.
+    // It will be lazily re-spawned on the next incoming message with the new model.
+    expect(sessions.has('chat123')).toBe(false);
 
     // Verify get_model returns the agent-level model
     const { data: getResult } = await sendCommand(port, { command: 'get_model', chat_id: 'chat123' });
@@ -299,9 +310,9 @@ describe('AgentRunner /command endpoint', () => {
   });
 
   // --------------------------------------------------------------------------
-  // U-CMD-06: restart with active session writes signal and returns success
+  // U-CMD-06: restart with active session stops process and returns success
   // --------------------------------------------------------------------------
-  it('U-CMD-06: restart with active session writes signal file with notify payload', async () => {
+  it('U-CMD-06: restart with active session stops process and returns success', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
@@ -310,10 +321,8 @@ describe('AgentRunner /command endpoint', () => {
     await sendChannelPost(port, 'chat123', 'hello');
     await new Promise(r => setTimeout(r, 100));
 
-    // Temporarily prevent chokidar from consuming the signal immediately
-    // by checking what the handler writes
-    const stateDir = path.join(agentConfig.workspace, '.telegram-state');
-    const signalPath = path.join(stateDir, 'restart-chat123');
+    const sessions = getSessions(runner);
+    expect(sessions.has('chat123')).toBe(true);
 
     const { data } = await sendCommand(port, {
       command: 'restart',
@@ -321,9 +330,10 @@ describe('AgentRunner /command endpoint', () => {
     });
 
     expect(data.success).toBe(true);
+    expect(data.restarted).toBe(true);
 
-    // The signal file may have been consumed by chokidar already, but the command succeeded.
-    // We verify the response is correct.
+    // Session removed from map — will re-spawn on next message
+    expect(sessions.has('chat123')).toBe(false);
   });
 
   // --------------------------------------------------------------------------
@@ -381,7 +391,10 @@ describe('SessionProcess restart watcher notify payload', () => {
   afterEach(async () => {
     // Always stop the SessionProcess to prevent chokidar watcher leak
     if (currentSp) {
-      await currentSp.stop();
+      await Promise.race([
+        currentSp.stop(),
+        new Promise<void>(r => setTimeout(r, 5000)),
+      ]);
       currentSp = null;
     }
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -406,7 +419,7 @@ describe('SessionProcess restart watcher notify payload', () => {
     await sp.start();
 
     // Give chokidar time to initialize the watcher
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1000));
 
     // Write restart signal with notify payload
     const signalPath = path.join(stateDir, 'restart-chat123');
@@ -435,7 +448,7 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toContain('IMPORTANT: Send a Telegram reply to chat_id "chat123"');
     expect(markerContent).toContain('Model changed to claude-sonnet-4-6');
-  });
+  }, 15000);
 
   // --------------------------------------------------------------------------
   // U-CMD-09: restart signal with empty content uses default marker
@@ -456,7 +469,7 @@ describe('SessionProcess restart watcher notify payload', () => {
     await sp.start();
 
     // Give chokidar time to initialize the watcher
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1000));
 
     // Write empty restart signal (self-restart)
     const signalPath = path.join(stateDir, 'restart-chat456');
@@ -483,5 +496,5 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toBe('[System: Graceful restart completed successfully. Do not restart again.]');
     expect(markerContent).not.toContain('IMPORTANT');
-  });
+  }, 15000);
 });

@@ -24,7 +24,7 @@ import * as os from 'os';
 
 import { loadConfig } from './config/loader';
 import { detectMigration, applyMigration, loadCleanTemplate } from './config/migrator';
-import { loadWorkspace, watchWorkspace, migrateWorkspaceFiles } from './agent/workspace-loader';
+import { loadWorkspace, watchWorkspace, migrateWorkspaceFiles, AGENT_WRITABLE_FILES } from './agent/workspace-loader';
 import { watchSkills } from './skills';
 import { syncSharedSkills, syncModuleSkills } from './skills/sync';
 import { createWatcher } from './watch/factory';
@@ -291,25 +291,39 @@ async function startAgent(
   schedulers.push(scheduler);
 
   // Watch workspace for changes
-  watchWorkspace(agentConfig.workspace, async () => {
-    logger.info('Workspace changed, reloading');
+  watchWorkspace(agentConfig.workspace, async (changedFiles) => {
+    logger.info('Workspace changed, reloading', { files: changedFiles });
     try {
       const updated = await loadWorkspace(agentConfig.workspace, {
         mcpToolsDir,
         sharedSkillsDir,
         logger,
       });
-      // Rewrite CLAUDE.md with updated system prompt and restart subprocess
+      // Always rewrite CLAUDE.md so the next spawn picks up the new content.
       await fs.promises.writeFile(
         path.join(agentConfig.workspace, 'CLAUDE.md'),
         updated.systemPrompt,
         'utf8',
       );
-      logger.info('Updated CLAUDE.md, restarting sessions');
       if (updated.skillRegistry) {
         runner.setSkillRegistry(updated.skillRegistry);
       }
-      await runner.restartOrDefer();
+      // Recompose always (above). For the restart, distinguish self-written
+      // files: when ONLY agent-writable files changed (MEMORY/USER/SOUL/AGENTS),
+      // the change most likely came from the running session mid-turn, so skip
+      // restarting busy sessions to avoid the self-restart footgun. Idle
+      // sessions are still restarted; any non-agent-writable file (e.g.
+      // HEARTBEAT.md) restores the normal restart-or-defer behavior.
+      const agentWritableOnly =
+        changedFiles.length > 0 &&
+        changedFiles.every((f) => AGENT_WRITABLE_FILES.has(f));
+      logger.info(
+        agentWritableOnly
+          ? 'Updated CLAUDE.md (agent-writable change), restarting idle sessions only'
+          : 'Updated CLAUDE.md, restarting sessions',
+        { files: changedFiles },
+      );
+      await runner.restartOrDefer({ skipBusy: agentWritableOnly });
       scheduler.load(updated.files.heartbeatMd);
     } catch (err) {
       logger.error('Failed to reload workspace', { error: (err as Error).message });
@@ -602,6 +616,25 @@ async function main(): Promise<void> {
     socketServer.stopApp(appName);
   };
 
+  // Compose has no host-reboot restart policy, so a running app's containers are
+  // down after a restart. Bring them up in the BACKGROUND — fire-and-forget so it
+  // never blocks the event loop or route wiring. Routes come up immediately below;
+  // until each app's containers finish `compose up --wait`, a request may briefly
+  // 502 (ECONNREFUSED), which self-heals within seconds. Non-fatal per app.
+  void appInstaller
+    .restoreRunningApps()
+    .then(({ attempted, failures }) => {
+      for (const f of failures) {
+        globalLogger.warn(`App store: failed to start "${f.app}" containers on restore (non-fatal): ${f.error}`);
+      }
+      if (attempted > 0) {
+        globalLogger.info(`App store: background container restore complete (${attempted - failures.length}/${attempted} started)`);
+      }
+    })
+    .catch((err) => {
+      globalLogger.warn('App store: background container restore failed (non-fatal)', { error: (err as Error).message });
+    });
+
   // Restore proxy routes, sockets, and agent entries for apps that were running before restart
   try {
     await router.loadProxyRoutes(appsRegistry);
@@ -624,6 +657,15 @@ async function main(): Promise<void> {
     for (const change of changes) {
       if (!change.hotReloadable) continue;
 
+      // Gateway-level changes (agentId === '')
+      if (change.agentId === '') {
+        if (change.field === 'gateway.headless') {
+          // Applies to sessions spawned after the change; running sessions keep their backend.
+          config.gateway.headless = change.newValue as boolean | undefined;
+        }
+        continue;
+      }
+
       const agentConfig = agentConfigs.get(change.agentId);
       if (!agentConfig) continue;
 
@@ -633,9 +675,6 @@ async function main(): Promise<void> {
           break;
         case 'claude.extraFlags':
           agentConfig.claude.extraFlags = change.newValue as string[];
-          break;
-        case 'claude.dangerouslySkipPermissions':
-          agentConfig.claude.dangerouslySkipPermissions = change.newValue as boolean;
           break;
         case 'session.idleTimeoutMinutes':
           if (!agentConfig.session) agentConfig.session = {};

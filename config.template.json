@@ -6,20 +6,23 @@
     ],
     "removePaths": [
       "telegram.allowedUsers",
-      "telegram.dmPolicy"
+      "telegram.dmPolicy",
+      "claude.dangerouslySkipPermissions"
     ]
   },
-  "configVersion": "1.0.7",
+  "configVersion": "1.0.10",
   "gateway": {
     "logDir": "~/.claude-gateway/logs",
     "timezone": "Asia/Bangkok",
     "models": [
-      { "id": "claude-fable-5",            "label": "Fable 5",    "alias": "fable",  "contextWindow": 1000000 },
-      { "id": "claude-opus-4-8",           "label": "Opus 4.8",   "alias": "opus",   "contextWindow": 1000000 },
-      { "id": "claude-opus-4-7",           "label": "Opus 4.7",   "alias": "opus47", "contextWindow": 1000000 },
-      { "id": "claude-opus-4-6",           "label": "Opus 4.6",   "alias": "opus46", "contextWindow": 1000000 },
-      { "id": "claude-sonnet-4-6",         "label": "Sonnet 4.6", "alias": "sonnet", "contextWindow": 1000000 },
-      { "id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",  "alias": "haiku",  "contextWindow": 200000 }
+      { "id": "claude-fable-5",            "label": "Fable 5",          "alias": "fable",       "contextWindow": 1000000 },
+      { "id": "claude-opus-4-8[1m]",       "label": "Opus 4.8 (1M)",    "alias": "opus[1m]",    "contextWindow": 1000000 },
+      { "id": "claude-sonnet-5[1m]",       "label": "Sonnet 5 (1M)",    "alias": "sonnet[1m]",  "contextWindow": 1000000 },
+      { "id": "claude-opus-4-8",           "label": "Opus 4.8",         "alias": "opus",        "contextWindow": 200000 },
+      { "id": "claude-opus-4-6",           "label": "Opus 4.6",         "alias": "opus46",      "contextWindow": 200000 },
+      { "id": "claude-sonnet-5",           "label": "Sonnet 5",         "alias": "sonnet",      "contextWindow": 200000 },
+      { "id": "claude-sonnet-4-6",         "label": "Sonnet 4.6",       "alias": "sonnet46",    "contextWindow": 200000 },
+      { "id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5",        "alias": "haiku",       "contextWindow": 200000 }
     ],
     "api": {
       "keys": [
@@ -39,7 +42,8 @@
       "retentionDays": 60,
       "cleanupHour": 0,
       "cleanupTimezone": "UTC"
-    }
+    },
+    "headless": true
   },
   "agents": [
     {
@@ -52,7 +56,6 @@
       },
       "claude": {
         "model": "claude-opus-4-6",
-        "dangerouslySkipPermissions": true,
         "extraFlags": []
       },
       "signatureEmoji": "",
@@ -75,9 +78,12 @@
       "telegram": {
         "botToken": "${BAERBEL_BOT_TOKEN}"
       },
+      "line": {
+        "channelAccessToken": "${BAERBEL_LINE_CHANNEL_ACCESS_TOKEN}",
+        "channelSecret": "${BAERBEL_LINE_CHANNEL_SECRET}"
+      },
       "claude": {
         "model": "claude-sonnet-4-6",
-        "dangerouslySkipPermissions": false,
         "extraFlags": []
       },
       "session": {

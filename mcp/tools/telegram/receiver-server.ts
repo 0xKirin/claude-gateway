@@ -29,6 +29,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { createWorkingStateManager } from './typing'
+import { initDedupDir, isDuplicate as _isDuplicate, pruneDedup as _pruneDedup } from './dedup'
 import { hasMarkdown, toTelegramHtml } from './pure'
 
 // Standalone fallback: default state dir to ~/.claude/channels/telegram
@@ -60,6 +61,24 @@ if (!TOKEN) {
 }
 
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const DEDUP_DIR = join(STATE_DIR, 'dedup')
+
+// Initialize dedup dir once at startup (not on every message).
+initDedupDir(DEDUP_DIR)
+// Prune stale markers left over from before this process started.
+_pruneDedup(DEDUP_DIR)
+
+function isDuplicate(chatId: string, msgId: number): boolean {
+  return _isDuplicate(DEDUP_DIR, chatId, msgId)
+}
+
+// Spread 11 concurrent receivers across the minute window with random jitter
+// so they don't all hit the dedup dir simultaneously on each tick.
+const pruneJitter = Math.floor(Math.random() * 60_000)
+setTimeout(() => {
+  _pruneDedup(DEDUP_DIR)
+  setInterval(() => _pruneDedup(DEDUP_DIR), 60_000).unref()
+}, pruneJitter).unref()
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -671,6 +690,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 const SEND_ONLY = process.env.TELEGRAM_SEND_ONLY === 'true'
 const RECEIVER_MODE = process.env.TELEGRAM_RECEIVER_MODE === 'true'
 
+import { parseMenuFileContent } from './menu-parser'
+
 const BOT_COMMANDS = [
   { command: 'session', description: 'Show current session info' },
   { command: 'sessions', description: 'Manage conversation sessions' },
@@ -690,11 +711,14 @@ const BOT_COMMANDS = [
 
 // Available AI models for /models command
 const AVAILABLE_MODELS = [
-  { id: 'claude-opus-4-8',          label: 'Opus 4.8',   alias: 'opus' },
-  { id: 'claude-opus-4-7',          label: 'Opus 4.7',   alias: 'opus47' },
-  { id: 'claude-opus-4-6',          label: 'Opus 4.6',   alias: 'opus46' },
-  { id: 'claude-sonnet-4-6',        label: 'Sonnet 4.6', alias: 'sonnet' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku' },
+  { id: 'claude-fable-5',            label: 'Fable 5',          alias: 'fable' },
+  { id: 'claude-opus-4-8[1m]',       label: 'Opus 4.8 (1M)',    alias: 'opus[1m]' },
+  { id: 'claude-sonnet-5[1m]',       label: 'Sonnet 5 (1M)',    alias: 'sonnet[1m]' },
+  { id: 'claude-opus-4-8',           label: 'Opus 4.8',         alias: 'opus' },
+  { id: 'claude-opus-4-6',           label: 'Opus 4.6',         alias: 'opus46' },
+  { id: 'claude-sonnet-5',           label: 'Sonnet 5',         alias: 'sonnet' },
+  { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6',       alias: 'sonnet46' },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5',        alias: 'haiku' },
 ]
 
 // Base URL for command API calls to the AgentRunner callback server.
@@ -732,6 +756,12 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  // Dedup BEFORE gate: prevent duplicate processing for all message types, including
+  // pairing flows (avoids double pairing-reply messages during receiver restart overlap).
+  const earlyChat = ctx.chat?.id
+  const earlyMsgId = ctx.message?.message_id
+  if (earlyChat != null && earlyMsgId != null && isDuplicate(String(earlyChat), earlyMsgId)) return
+
   const result = gate(ctx)
 
   if (result.action === 'drop') return
@@ -1127,17 +1157,93 @@ bot.command('clear', async ctx => {
   ).catch(() => {})
 })
 
+// Shared auth check for all callback_query:data handlers.
+// Mirrors the text-reply path: sender must be in allowFrom.
+function isCallbackAuthorized(ctx: Context): boolean {
+  const access = loadAccess()
+  return access.allowFrom.includes(String(ctx.from?.id ?? ''))
+}
+
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
+  // Handle interactive-menu choice: choice:<N>. A tap is routed back exactly like
+  // the user typing "N" — same content + meta as the text path — so the session's
+  // pending-menu handler injects the selection into the PTY. Security mirrors the
+  // text path: the tapper must be in allowFrom.
+  const choiceMatch = /^choice:(\d+)$/.exec(data)
+  if (choiceMatch) {
+    if (!isCallbackAuthorized(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chat_id = String(ctx.callbackQuery.message?.chat.id ?? ctx.from.id)
+    const choice = choiceMatch[1]
+    // Remove the keyboard immediately to prevent double-selection.
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: `✓ ${choice}` }).catch(() => {})
+    const callbackUrl = process.env.CLAUDE_CHANNEL_CALLBACK
+    if (callbackUrl) {
+      const channelParams = {
+        content: choice,
+        meta: {
+          chat_id,
+          user: ctx.from.username ?? String(ctx.from.id),
+          user_id: String(ctx.from.id),
+          ts: new Date().toISOString(),
+        },
+      }
+      fetch(callbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(channelParams),
+      }).catch(err => {
+        process.stderr.write(`telegram channel: choice callback POST failed: ${err}\n`)
+      })
+      if (RECEIVER_MODE) typingManager.start(chat_id)
+    }
+    return
+  }
+
+  // Handle interactive-menu cancel: dismiss the pending menu without sending
+  // any text to the session. Posts a special sentinel that the PTY wrapper
+  // translates to ESC, clearing pendingMenu cleanly.
+  if (data === 'menu:cancel') {
+    if (!isCallbackAuthorized(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chat_id = String(ctx.callbackQuery.message?.chat.id ?? ctx.from.id)
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: '✓ Cancelled' }).catch(() => {})
+    const callbackUrl = process.env.CLAUDE_CHANNEL_CALLBACK
+    if (callbackUrl) {
+      fetch(callbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: '__MENU_CANCEL__',
+          meta: {
+            chat_id,
+            user: ctx.from.username ?? String(ctx.from.id),
+            user_id: String(ctx.from.id),
+            ts: new Date().toISOString(),
+          },
+        }),
+      }).catch(err => {
+        process.stderr.write(`telegram channel: menu cancel callback POST failed: ${err}\n`)
+      })
+    }
+    return
+  }
+
   // Handle model selection callback: model:<model_id>
   const modelMatch = /^model:(.+)$/.exec(data)
   if (modelMatch) {
-    const access = loadAccess()
-    if (!access.allowFrom.includes(String(ctx.from.id))) {
+    if (!isCallbackAuthorized(ctx)) {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
       return
     }
@@ -1158,14 +1264,8 @@ bot.on('callback_query:data', async ctx => {
       })
       const result = (await res.json()) as { success?: boolean; error?: string; restarted?: boolean }
       if (result.success) {
-        if (result.restarted === false) {
-          // No active session — model changed, no restart needed
-          await ctx.answerCallbackQuery({ text: `Model changed to ${newModel}` }).catch(() => {})
-          await ctx.editMessageText(`\u2705 Model changed to ${newModel}`).catch(() => {})
-        } else {
-          await ctx.answerCallbackQuery({ text: `Switching to ${newModel}...` }).catch(() => {})
-          await ctx.editMessageText(`\u23f3 Switching to ${newModel}...`).catch(() => {})
-        }
+        await ctx.answerCallbackQuery({ text: `✅ Model changed to ${newModel}` }).catch(() => {})
+        await ctx.editMessageText(`\u2705 Model changed to ${newModel}`).catch(() => {})
       } else {
         await ctx.answerCallbackQuery({ text: result.error ?? 'Failed' }).catch(() => {})
       }
@@ -1614,6 +1714,48 @@ if (RECEIVER_MODE) {
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+
+  // Interactive-menu delivery. The AgentRunner drops a `<chatId>.menu` file in
+  // TYPING_DIR whenever the PTY session blocks on an interactive select menu
+  // (AskUserQuestion / plan approval). We render it as inline buttons here.
+  //
+  // This MUST be independent of the typing-indicator lifecycle: a menu can be
+  // emitted after typing has already been torn down (e.g. the agent called the
+  // reply tool earlier in the same turn, or the turn ended), and the old
+  // stop()-coupled drain would early-return on a missing typing state, leaving
+  // the .menu file orphaned and the user staring at a silent chat. A standalone
+  // poller — mirroring the Discord side — guarantees every menu reaches the chat.
+  function drainMenuFiles(): void {
+    let files: string[]
+    try {
+      files = readdirSync(TYPING_DIR)
+    } catch {
+      return
+    }
+    for (const name of files) {
+      if (!name.endsWith('.menu')) continue
+      const chatId = name.slice(0, -'.menu'.length)
+      const menuPath = join(TYPING_DIR, name)
+      let raw: string
+      try {
+        raw = readFileSync(menuPath, 'utf8').trim()
+      } catch {
+        // Malformed or mid-write (the runner writes atomically, so this is rare) —
+        // drop it so the poller doesn't spin on the same bad file forever.
+        rmSync(menuPath, { force: true })
+        continue
+      }
+      // Remove BEFORE sending: a slow or failing send must not let the next tick
+      // re-deliver the same menu (which would stack duplicate button messages).
+      rmSync(menuPath, { force: true })
+      const msg = parseMenuFileContent(raw)
+      if (!msg) continue
+      void bot.api.sendMessage(chatId, msg.text, { reply_markup: { inline_keyboard: msg.inline_keyboard } }).catch(err => {
+        process.stderr.write(`telegram channel (receiver): failed to send menu to ${chatId}: ${err}\n`)
+      })
+    }
+  }
+  setInterval(drainMenuFiles, 1000).unref()
 
   void (async () => {
     for (let attempt = 1; ; attempt++) {
