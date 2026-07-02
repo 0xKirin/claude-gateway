@@ -1,8 +1,25 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import * as pty from 'node-pty';
 
 const WRITE_CHUNK_BYTES = 8 * 1024;
 const WRITE_CHUNK_DELAY_MS = 10;
+
+// node-pty's Windows agent calls CreateProcess directly and, unlike Node's own
+// child_process.spawn, does NOT search PATHEXT for an extension-less command
+// (e.g. "claude" won't resolve to "claude.exe" on PATH). Resolve it ourselves.
+function resolveBinary(bin: string): string {
+  if (process.platform !== 'win32' || /[\\/]/.test(bin)) return bin;
+  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+  const dirs = (process.env.PATH ?? '').split(';');
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, bin + ext);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return bin;
+}
 
 // Keys matching these prefixes are scrubbed before spawning the child PTY:
 // CLAUDECODE/CLAUDE_CODE_ prevent nested-claude child-session behavior that
@@ -44,7 +61,7 @@ export class PtyHost {
     if (path.basename(binary).includes('claude-pty-shell')) {
       throw new Error(`refusing to spawn self as claude binary: ${binary}`);
     }
-    this.child = pty.spawn(binary, args, {
+    this.child = pty.spawn(resolveBinary(binary), args, {
       name: 'xterm-256color',
       cols: opts.cols,
       rows: opts.rows,

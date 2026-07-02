@@ -22,7 +22,13 @@ export function preTrustWorkspace(
   cwd: string,
   claudeJsonPath?: string,
 ): void {
-  _writeClaudeJsonFlags(cwd, claudeJsonPath ?? path.join(os.homedir(), '.claude.json'));
+  // Claude Code keys projects[] by forward-slash paths even on Windows
+  // (verified against ~/.claude.json entries written by the real CLI). A
+  // backslash key here silently misses that lookup and the trust dialog
+  // still blocks the PTY on startup.
+  const normalizedCwd = process.platform === 'win32' ? cwd.replace(/\\/g, '/') : cwd;
+  const defaultConfigDir = process.env.CLAUDE_CONFIG_DIR || os.homedir();
+  _writeClaudeJsonFlags(normalizedCwd, claudeJsonPath ?? path.join(defaultConfigDir, '.claude.json'));
 }
 
 function _writeClaudeJsonFlags(cwd: string, configPath: string): void {

@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import * as http from 'node:http';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -415,28 +415,52 @@ export class GatewayRouter {
         res.json({ processes: this.processesCache.data, numCpus: GatewayRouter.NUM_CPUS });
         return;
       }
-      exec(
-        "ps -eo pid,ppid,stat,%cpu,%mem,rss,args --no-headers 2>/dev/null | grep -E 'claude|bun.*gateway|bun.*mcp|bun.*receiver|node.*dist/' | grep -v grep | grep -v vscode",
-        { encoding: 'utf8', timeout: 5000 },
-        (err, stdout) => {
-          if (err) process.stderr.write(`[processes] ps error: ${err.message}\n`);
-          const processes = (stdout ?? '').trim().split('\n').filter(Boolean).map((line) => {
-            const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(.+)$/);
-            if (!m) return null;
-            return {
-              pid: parseInt(m[1]),
-              ppid: parseInt(m[2]),
-              stat: m[3],
-              cpu: parseFloat(m[4]),
-              mem: parseFloat(m[5]),
-              rssKb: parseInt(m[6]),
-              args: m[7].trim(),
-            };
-          }).filter(Boolean);
-          this.processesCache = { data: processes, ts: Date.now() };
-          res.json({ processes, numCpus: GatewayRouter.NUM_CPUS });
-        },
-      );
+      const handleOutput = (err: Error | null, stdout: string | null | undefined) => {
+        if (err) process.stderr.write(`[processes] ps error: ${err.message}\n`);
+        const processes = (stdout ?? '').trim().split('\n').filter(Boolean).map((line) => {
+          const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(.+)$/);
+          if (!m) return null;
+          return {
+            pid: parseInt(m[1]),
+            ppid: parseInt(m[2]),
+            stat: m[3],
+            cpu: parseFloat(m[4]),
+            mem: parseFloat(m[5]),
+            rssKb: parseInt(m[6]),
+            args: m[7].trim(),
+          };
+        }).filter(Boolean);
+        this.processesCache = { data: processes, ts: Date.now() };
+        res.json({ processes, numCpus: GatewayRouter.NUM_CPUS });
+      };
+
+      if (process.platform === 'win32') {
+        // No `ps`/`grep` on Windows. Use WMI via PowerShell to emit lines in the
+        // same "pid ppid stat cpu mem rss args" shape the posix parser expects.
+        // cpu%/mem% aren't cheaply available per-process from Win32_Process, so
+        // they're reported as 0.0; rss (KB) comes from WorkingSetSize.
+        const psScript =
+          '$self = $PID; ' +
+          'Get-CimInstance Win32_Process | Where-Object { ' +
+          '$_.ProcessId -ne $self -and ' +
+          "$_.CommandLine -match 'claude|bun.*gateway|bun.*mcp|bun.*receiver|node.*dist' -and " +
+          "$_.CommandLine -notmatch 'vscode' " +
+          '} | ForEach-Object { ' +
+          '"$($_.ProcessId) $($_.ParentProcessId) R 0.0 0.0 $([math]::Round($_.WorkingSetSize/1024)) $($_.CommandLine)" ' +
+          '}';
+        execFile(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', psScript],
+          { encoding: 'utf8', timeout: 5000 },
+          handleOutput,
+        );
+      } else {
+        exec(
+          "ps -eo pid,ppid,stat,%cpu,%mem,rss,args --no-headers 2>/dev/null | grep -E 'claude|bun.*gateway|bun.*mcp|bun.*receiver|node.*dist/' | grep -v grep | grep -v vscode",
+          { encoding: 'utf8', timeout: 5000 },
+          handleOutput,
+        );
+      }
     });
 
     // PTY screen snapshot — plain text, ANSI stripped. For agents that need to

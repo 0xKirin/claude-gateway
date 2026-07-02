@@ -37,6 +37,9 @@ export class PtyStreamRegistry {
     // 48 chars comfortably fits a full UUID without truncation — two sessions
     // must never collide onto the same socket (that would cross-wire output).
     const safe = streamKey.replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
+    // Windows has no filesystem-backed unix domain sockets for net.Server —
+    // it needs the \\.\pipe\ namespace instead, or listen() fails EACCES.
+    if (process.platform === 'win32') return `\\\\.\\pipe\\gw-pty-${safe}`;
     return path.join(os.tmpdir(), `gw-pty-${safe}.sock`);
   }
 
